@@ -85,7 +85,7 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
         score: 0,
       };
 
-      const match = matchmaker.findOrCreateMatch(roomType, player);
+      const match = await matchmaker.findOrCreateMatch(roomType, player);
       matchmaker.addSocketToMatch(match.id, socket.id, playerId);
 
       // Save match to database
@@ -194,7 +194,7 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
         return;
       }
 
-      matchmaker.removePlayer(playerId);
+      matchmaker.removePlayer(playerId).catch(err => console.error('Error removing player:', err));
       matchmaker.removeSocketFromMatch(match.id, socket.id);
       socket.leave(match.id);
 
@@ -241,7 +241,7 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
         const match = matchmaker.getMatchByPlayerId(playerId);
         if (match) {
           // Remove player from match
-          matchmaker.removePlayer(playerId);
+          matchmaker.removePlayer(playerId).catch(err => console.error('Error removing player:', err));
           matchmaker.removeSocketFromMatch(match.id, socket.id);
 
           // Notify other players
