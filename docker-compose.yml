@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: last-game-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lastgame
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: lastgame
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: postgres -p 5433
+    ports:
+      - "5433:5433"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lastgame -d lastgame -p 5433"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - last-game-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: last-game-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://lastgame:admin@postgres:5433/lastgame
+      PORT: 4444
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      PAYMENT_SECRET_KEY: ${PAYMENT_SECRET_KEY:-}
+    ports:
+      - "4444:4444"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - last-game-network
+    command: >
+      sh -c "
+        echo '⏳ Waiting for database to be ready...' &&
+        sleep 5 &&
+        echo '🚀 Running Prisma migrations...' &&
+        npx prisma migrate deploy &&
+        echo '✅ Starting backend server...' &&
+        node dist/src/server.js
+      "
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  last-game-network:
+    driver: bridge
+

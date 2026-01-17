@@ -1,0 +1,264 @@
+import { Server, Socket } from 'socket.io';
+import { matchmaker } from '../services/Matchmaker.js';
+import { paymentService } from '../services/PaymentService.js';
+import { matchService } from '../services/MatchService.js';
+import { Player, RoomType } from '../types/game';
+import { parseTelegramUser, validateTelegramData } from '../utils/telegram.js';
+import { ROOM_PRESETS } from '../constants/rooms.js';
+
+interface JoinRoomData {
+  roomType: RoomType;
+  initData?: string; // Telegram WebApp initData
+  userId?: string; // Fallback for development
+  userName?: string; // Fallback for development
+  paymentId?: string; // Payment ID for paid rooms
+  paymentSignature?: string; // Payment signature for verification
+}
+
+export function setupMatchmakingHandlers(io: Server, socket: Socket) {
+  /**
+   * Join a room/match
+   */
+  socket.on('match:join', async (data: JoinRoomData) => {
+    try {
+      const { roomType, initData, userId, userName, paymentId, paymentSignature } = data;
+
+      // Parse user from Telegram or use fallback
+      let playerId: string;
+      let playerName: string;
+
+      if (initData) {
+        // Validate Telegram initData if bot token is configured
+        const botToken = process.env.TELEGRAM_BOT_TOKEN;
+        if (botToken) {
+          const isValid = validateTelegramData(initData, botToken);
+          if (!isValid) {
+            socket.emit('error', { message: 'Invalid Telegram data signature' });
+            return;
+          }
+        }
+
+        const telegramUser = parseTelegramUser(initData);
+        if (!telegramUser) {
+          socket.emit('error', { message: 'Invalid Telegram data' });
+          return;
+        }
+        playerId = telegramUser.id.toString();
+        playerName = telegramUser.first_name || 'Player';
+      } else {
+        // Development fallback
+        playerId = userId || socket.id;
+        playerName = userName || 'Player';
+      }
+
+      // Check if player is already in a match
+      const existingMatch = matchmaker.getMatchByPlayerId(playerId);
+      if (existingMatch) {
+        socket.emit('match:alreadyJoined', { match: existingMatch });
+        return;
+      }
+
+      // For paid rooms, verify payment before joining
+      if (roomType !== 'free') {
+        if (!paymentId || !paymentSignature) {
+          socket.emit('error', { message: 'Payment required for paid rooms' });
+          return;
+        }
+
+        // Verify payment
+        const paymentVerified = await paymentService.verifyEntryPayment(
+          paymentId,
+          playerId,
+          paymentSignature
+        );
+
+        if (!paymentVerified) {
+          socket.emit('error', { message: 'Payment verification failed' });
+          return;
+        }
+      }
+
+      // Create or find match
+      const player: Player = {
+        id: playerId,
+        name: playerName,
+        score: 0,
+      };
+
+      const match = matchmaker.findOrCreateMatch(roomType, player);
+      matchmaker.addSocketToMatch(match.id, socket.id, playerId);
+
+      // Save match to database
+      try {
+        await matchService.saveMatch(match);
+      } catch (error) {
+        console.error('Failed to save match to database:', error);
+        // Continue anyway, match can work without DB
+      }
+
+      // Link payment to match if paid room
+      if (roomType !== 'free' && paymentId) {
+        try {
+          await paymentService.linkPaymentToMatch(paymentId, match.id);
+        } catch (error) {
+          console.error('Failed to link payment to match:', error);
+          // Continue anyway, payment is already verified
+        }
+      }
+
+      // Join socket room for this match
+      socket.join(match.id);
+
+      // Check if match is ready to start BEFORE notifying players
+      // This ensures all players get the correct status
+      let matchToNotify = match;
+      let matchJustStarted = false;
+      
+      if (matchmaker.isMatchReady(match.id)) {
+        const startedMatch = matchmaker.startMatch(match.id);
+        if (startedMatch) {
+          matchToNotify = startedMatch;
+          matchJustStarted = true;
+          
+          // Save match with 'playing' status to database
+          try {
+            await matchService.saveMatch(startedMatch);
+            console.log(`✅ Saved match ${startedMatch.id} to database with status: ${startedMatch.status}`);
+          } catch (error) {
+            console.error('Failed to save started match to database:', error);
+          }
+        }
+      }
+
+      // Notify player with current match state (may be already started)
+      socket.emit('match:joined', {
+        match: matchToNotify,
+        playerId,
+      });
+
+      // Notify other players in the match with updated state
+      socket.to(match.id).emit('match:playerJoined', {
+        match: matchToNotify,
+        newPlayer: player,
+      });
+
+      // If match just started, notify all players and start round
+      if (matchJustStarted) {
+        // Match just started, notify all players
+        io.to(match.id).emit('match:started', { match: matchToNotify });
+        
+        // Start first round after 2 seconds
+        setTimeout(() => {
+          import('./game.js').then(({ startRoundForMatch }) => {
+            startRoundForMatch(io, match.id);
+          });
+        }, 2000);
+      } else if (matchToNotify.status === 'playing') {
+        // Match is already playing, check if round has started
+        if (matchToNotify.roundStartTime) {
+          // Round is already in progress, send round:started to new player
+          socket.emit('round:started', {
+            match: matchToNotify,
+            roundNumber: matchToNotify.currentRound,
+            startTime: matchToNotify.roundStartTime,
+            endTime: matchToNotify.roundEndTime,
+          });
+          console.log(`Sent round:started to new player ${playerId} for ongoing round ${matchToNotify.currentRound}`);
+        } else {
+          // Match is playing but round hasn't started yet, wait for it
+          console.log(`Match ${match.id} is playing but round not started yet for player ${playerId}`);
+        }
+      }
+
+      console.log(`Player ${playerName} (${playerId}) joined match ${match.id}`);
+    } catch (error) {
+      console.error('Match join error:', error);
+      socket.emit('error', { message: 'Failed to join match' });
+    }
+  });
+
+  /**
+   * Leave match
+   */
+  socket.on('match:leave', () => {
+    try {
+      const playerId = matchmaker.getPlayerBySocket(socket.id);
+      if (!playerId) {
+        socket.emit('error', { message: 'Player not found in any match' });
+        return;
+      }
+
+      const match = matchmaker.getMatchByPlayerId(playerId);
+      if (!match) {
+        socket.emit('error', { message: 'Match not found' });
+        return;
+      }
+
+      matchmaker.removePlayer(playerId);
+      matchmaker.removeSocketFromMatch(match.id, socket.id);
+      socket.leave(match.id);
+
+      // Notify other players
+      const updatedMatch = matchmaker.getMatch(match.id);
+      if (updatedMatch) {
+        socket.to(match.id).emit('match:playerLeft', {
+          match: updatedMatch,
+          playerId,
+        });
+      }
+
+      socket.emit('match:left', { matchId: match.id });
+    } catch (error) {
+      console.error('Match leave error:', error);
+      socket.emit('error', { message: 'Failed to leave match' });
+    }
+  });
+
+  /**
+   * Get match status
+   */
+  socket.on('match:status', (data: { matchId: string }) => {
+    try {
+      const match = matchmaker.getMatch(data.matchId);
+      if (match) {
+        socket.emit('match:status', { match });
+      } else {
+        socket.emit('error', { message: 'Match not found' });
+      }
+    } catch (error) {
+      console.error('Match status error:', error);
+      socket.emit('error', { message: 'Failed to get match status' });
+    }
+  });
+
+  /**
+   * Handle disconnect
+   */
+  socket.on('disconnect', () => {
+    try {
+      const playerId = matchmaker.getPlayerBySocket(socket.id);
+      if (playerId) {
+        const match = matchmaker.getMatchByPlayerId(playerId);
+        if (match) {
+          // Remove player from match
+          matchmaker.removePlayer(playerId);
+          matchmaker.removeSocketFromMatch(match.id, socket.id);
+
+          // Notify other players
+          const updatedMatch = matchmaker.getMatch(match.id);
+          if (updatedMatch) {
+            socket.to(match.id).emit('match:playerLeft', {
+              match: updatedMatch,
+              playerId,
+            });
+          }
+
+          console.log(`Player ${playerId} disconnected from match ${match.id}`);
+        }
+      }
+    } catch (error) {
+      console.error('Disconnect error:', error);
+    }
+  });
+}
+
