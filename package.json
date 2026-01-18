@@ -10,6 +10,10 @@
     "start": "node dist/server.js",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
@@ -39,8 +43,10 @@
     "@types/pg": "^8.11.10",
     "@typescript-eslint/eslint-plugin": "^6.13.1",
     "@typescript-eslint/parser": "^6.13.1",
+    "@vitest/ui": "^4.0.17",
     "eslint": "^9.13.0",
     "tsx": "^4.7.0",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.0.17"
   }
 }

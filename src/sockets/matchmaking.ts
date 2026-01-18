@@ -2,6 +2,7 @@ import { Server, Socket } from 'socket.io';
 import { matchmaker } from '../services/Matchmaker.js';
 import { paymentService } from '../services/PaymentService.js';
 import { matchService } from '../services/MatchService.js';
+import { joinIntentService } from '../services/JoinIntentService.js';
 import { Player, RoomType } from '../types/game';
 import { parseTelegramUser, validateTelegramData } from '../utils/telegram.js';
 import { ROOM_PRESETS } from '../constants/rooms.js';
@@ -16,6 +17,52 @@ interface JoinRoomData {
 }
 
 export function setupMatchmakingHandlers(io: Server, socket: Socket) {
+  /**
+   * Subscribe to join intent status updates
+   * Client can subscribe to specific intent or player events
+   */
+  socket.on('join-intent:subscribe', (data: { intentId?: string; playerId?: string }) => {
+    try {
+      const { intentId, playerId } = data;
+      
+      if (intentId) {
+        socket.join(`intent:${intentId}`);
+        console.log(`📡 Socket ${socket.id} subscribed to intent:${intentId}`);
+      }
+      
+      if (playerId) {
+        socket.join(`player:${playerId}`);
+        console.log(`📡 Socket ${socket.id} subscribed to player:${playerId}`);
+      }
+      
+      if (!intentId && !playerId) {
+        socket.emit('error', { message: 'Must provide intentId or playerId' });
+      }
+    } catch (error) {
+      console.error('Error subscribing to join intent:', error);
+      socket.emit('error', { message: 'Failed to subscribe to join intent' });
+    }
+  });
+
+  /**
+   * Unsubscribe from join intent status updates
+   */
+  socket.on('join-intent:unsubscribe', (data: { intentId?: string; playerId?: string }) => {
+    try {
+      const { intentId, playerId } = data;
+      
+      if (intentId) {
+        socket.leave(`intent:${intentId}`);
+      }
+      
+      if (playerId) {
+        socket.leave(`player:${playerId}`);
+      }
+    } catch (error) {
+      console.error('Error unsubscribing from join intent:', error);
+    }
+  });
+
   /**
    * Join a room/match
    */
@@ -59,22 +106,39 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
       }
 
       // For paid rooms, verify payment before joining
+      let paidIntent: any = null; // Store TON intent for later linking
+      
       if (roomType !== 'free') {
-        if (!paymentId || !paymentSignature) {
-          socket.emit('error', { message: 'Payment required for paid rooms' });
-          return;
-        }
+        if (roomType === 'ton') {
+          // For TON rooms, verify JoinIntent instead of payment
+          paidIntent = await joinIntentService.getPaidIntentForJoin(playerId, 'ton');
+          
+          if (!paidIntent) {
+            socket.emit('error', { 
+              message: 'No paid deposit found. Please complete the deposit transaction first.' 
+            });
+            return;
+          }
 
-        // Verify payment
-        const paymentVerified = await paymentService.verifyEntryPayment(
-          paymentId,
-          playerId,
-          paymentSignature
-        );
+          console.log(`✅ Verified paid JoinIntent ${paidIntent.id} for player ${playerId} joining TON room`);
+        } else if (roomType === 'stars') {
+          // For Stars rooms, verify Telegram payment
+          if (!paymentId || !paymentSignature) {
+            socket.emit('error', { message: 'Payment required for paid rooms' });
+            return;
+          }
 
-        if (!paymentVerified) {
-          socket.emit('error', { message: 'Payment verification failed' });
-          return;
+          // Verify payment
+          const paymentVerified = await paymentService.verifyEntryPayment(
+            paymentId,
+            playerId,
+            paymentSignature
+          );
+
+          if (!paymentVerified) {
+            socket.emit('error', { message: 'Payment verification failed' });
+            return;
+          }
         }
       }
 
@@ -96,18 +160,27 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
         // Continue anyway, match can work without DB
       }
 
-      // Link payment to match if paid room
-      if (roomType !== 'free' && paymentId) {
+      // Link payment/intent to match if paid room
+      if (roomType !== 'free') {
         try {
-          await paymentService.linkPaymentToMatch(paymentId, match.id);
+          if (roomType === 'ton' && paidIntent) {
+            // Link JoinIntent to match for TON rooms
+            await joinIntentService.linkIntentToMatch(paidIntent.id, match.id);
+          } else if (roomType === 'stars' && paymentId) {
+            // Link Payment to match for Stars rooms
+            await paymentService.linkPaymentToMatch(paymentId, match.id);
+          }
         } catch (error) {
-          console.error('Failed to link payment to match:', error);
-          // Continue anyway, payment is already verified
+          console.error('Failed to link payment/intent to match:', error);
+          // Continue anyway, payment/intent is already verified
         }
       }
 
       // Join socket room for this match
       socket.join(match.id);
+      
+      // Also join player room for receiving join-intent events
+      socket.join(`player:${playerId}`);
 
       // Check if match is ready to start BEFORE notifying players
       // This ensures all players get the correct status
@@ -180,7 +253,7 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
   /**
    * Leave match
    */
-  socket.on('match:leave', () => {
+  socket.on('match:leave', async () => {
     try {
       const playerId = matchmaker.getPlayerBySocket(socket.id);
       if (!playerId) {
@@ -192,6 +265,22 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
       if (!match) {
         socket.emit('error', { message: 'Match not found' });
         return;
+      }
+
+      // Create refund for TON rooms if match hasn't started yet
+      if (match.roomType === 'ton' && match.status === 'waiting') {
+        try {
+          const refundId = await joinIntentService.createRefundForPlayer(playerId, match.id, 'player_left');
+          if (refundId) {
+            console.log(`💰 Refund ${refundId} created for player ${playerId} leaving TON match ${match.id}`);
+            // TODO: Send refund transaction via blockchain worker
+            // For now, refund record is created and status is CREATED
+            // Actual transaction will be sent by a worker/service later
+          }
+        } catch (error) {
+          console.error(`❌ Failed to create refund for player ${playerId}:`, error);
+          // Don't block leaving match - refund can be handled later
+        }
       }
 
       matchmaker.removePlayer(playerId).catch(err => console.error('Error removing player:', err));
@@ -234,12 +323,26 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
   /**
    * Handle disconnect
    */
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     try {
       const playerId = matchmaker.getPlayerBySocket(socket.id);
       if (playerId) {
         const match = matchmaker.getMatchByPlayerId(playerId);
         if (match) {
+          // Create refund for TON rooms if match hasn't started yet
+          if (match.roomType === 'ton' && match.status === 'waiting') {
+            try {
+              const refundId = await joinIntentService.createRefundForPlayer(playerId, match.id, 'player_left');
+              if (refundId) {
+                console.log(`💰 Refund ${refundId} created for player ${playerId} disconnecting from TON match ${match.id}`);
+                // TODO: Send refund transaction via blockchain worker
+              }
+            } catch (error) {
+              console.error(`❌ Failed to create refund for disconnected player ${playerId}:`, error);
+              // Don't block disconnect - refund can be handled later
+            }
+          }
+
           // Remove player from match
           matchmaker.removePlayer(playerId).catch(err => console.error('Error removing player:', err));
           matchmaker.removeSocketFromMatch(match.id, socket.id);

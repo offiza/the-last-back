@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import routes from './routes/index.js';
 import { setupSocketHandlers } from './sockets/index.js';
+import { blockchainWorker } from './workers/blockchainWorker.js';
 
 // Load .env from backend directory or root directory
 const __filename = fileURLToPath(import.meta.url);
@@ -47,10 +48,32 @@ app.get('/health', (req, res) => {
 // WebSocket handlers
 setupSocketHandlers(io);
 
+// Start blockchain worker
+blockchainWorker.start(io);
+
 // Start server
 httpServer.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready`);
   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  blockchainWorker.stop();
+  httpServer.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully...');
+  blockchainWorker.stop();
+  httpServer.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
 

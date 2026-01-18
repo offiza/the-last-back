@@ -43,6 +43,7 @@ model Match {
   // Relations
   players     MatchPlayer[]
   payments    Payment[]
+  joinIntents JoinIntent[]
 
   @@index([roomType, status])
   @@index([finishedAt])
@@ -97,4 +98,95 @@ model Payment {
   @@index([currency])
   @@index([paymentType])
   @@map("payments")
+}
+
+// Wallet connection (TON Connect)
+model Wallet {
+  id          String   @id @default(cuid())
+  playerId    String   @unique // Telegram user ID
+  address     String   @unique // TON wallet address
+  network     String   // 'mainnet' | 'testnet'
+  publicKey   String   // Public key for ton_proof verification
+  connectedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  joinIntents JoinIntent[]
+
+  @@index([playerId])
+  @@index([address])
+  @@map("wallets")
+}
+
+// Join Intent - намерение входа в комнату за TON
+model JoinIntent {
+  id          String   @id @default(cuid())
+  roomId      String?  // Match ID (null если комната еще не создана)
+  playerId    String   // Telegram user ID
+  walletId    String   // Reference to Wallet
+  roomType    String   // 'ton'
+  stake       Decimal  @db.Decimal(18, 9) // TON amount (включая комиссию)
+  nonce       String   @unique // Уникальный nonce для платежа (в comment транзакции)
+  status      String   // 'CREATED' | 'PAID' | 'CANCELLED' | 'REFUNDED'
+  expiresAt   DateTime // Таймаут если не оплачено (5 минут)
+  createdAt   DateTime @default(now())
+  paidAt      DateTime?
+  cancelledAt DateTime?
+  refundedAt  DateTime?
+
+  // Relations
+  wallet      Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  match       Match?   @relation(fields: [roomId], references: [id], onDelete: SetNull)
+  deposit     DepositTx?
+  refund      Refund?
+
+  @@index([playerId, status])
+  @@index([nonce])
+  @@index([status, expiresAt]) // Для авто-отмены просроченных
+  @@index([walletId])
+  @@map("join_intents")
+}
+
+// Deposit transaction (связь с блокчейном)
+model DepositTx {
+  id           String   @id @default(cuid())
+  joinIntentId String   @unique
+  txHash       String   @unique // TON transaction hash
+  fromAddress  String   // Wallet address игрока
+  toAddress    String   // Escrow address (smart contract)
+  amount       Decimal  @db.Decimal(18, 9) // TON amount
+  status       String   // 'SEEN' | 'CONFIRMED' | 'FAILED'
+  blockNumber  BigInt?
+  confirmedAt  DateTime?
+  createdAt    DateTime @default(now())
+
+  // Relations
+  joinIntent   JoinIntent @relation(fields: [joinIntentId], references: [id], onDelete: Cascade)
+
+  @@index([txHash])
+  @@index([fromAddress])
+  @@index([toAddress])
+  @@index([status])
+  @@map("deposit_txs")
+}
+
+// Refunds (рефанды при выходе или таймауте)
+model Refund {
+  id           String   @id @default(cuid())
+  joinIntentId String   @unique
+  txHash       String?  // TON transaction hash для рефанда
+  amount       Decimal  @db.Decimal(18, 9) // TON amount
+  toAddress    String   // Wallet address для рефанда
+  status       String   // 'CREATED' | 'SENT' | 'CONFIRMED' | 'FAILED'
+  reason       String   // 'player_left' | 'timeout' | 'match_cancelled'
+  createdAt    DateTime @default(now())
+  confirmedAt  DateTime?
+
+  // Relations
+  joinIntent   JoinIntent @relation(fields: [joinIntentId], references: [id], onDelete: Cascade)
+
+  @@index([joinIntentId])
+  @@index([txHash])
+  @@index([status])
+  @@map("refunds")
 }

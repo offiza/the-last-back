@@ -36,6 +36,7 @@ services:
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       PAYMENT_SECRET_KEY: ${PAYMENT_SECRET_KEY:-}
+      TON_ESCROW_ADDRESS: ${TON_ESCROW_ADDRESS:-}
     ports:
       - "4444:4444"
     depends_on:
