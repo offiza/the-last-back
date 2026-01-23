@@ -13,12 +13,11 @@ const CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
 export class BlockchainWorker {
   private intervalId: NodeJS.Timeout | null = null;
   private io: Server | null = null;
-  private lastCheckedLt: string | null = null;
 
   /**
    * Start the blockchain worker
    */
-  start(io: Server) {
+  async start(io: Server) {
     this.io = io;
 
     if (this.intervalId) {
@@ -27,6 +26,9 @@ export class BlockchainWorker {
     }
 
     console.log('🔍 Starting blockchain worker...');
+
+    // Load lastCheckedLt from database
+    await this.loadLastCheckedLt();
 
     // Run immediately on start
     this.checkTransactions().catch((error) => {
@@ -85,13 +87,20 @@ export class BlockchainWorker {
         return; // No active intents to check
       }
 
+      // Load lastCheckedLt from database (persistent storage)
+      const lastCheckedLt = await this.getLastCheckedLt();
+
       // Check incoming transactions
-      const matches = await tonBlockchainService.checkIncomingTransactions(
+      const { matches, latestLt } = await tonBlockchainService.checkIncomingTransactions(
         escrowAddress,
-        this.lastCheckedLt || undefined
+        lastCheckedLt || undefined
       );
 
       if (matches.length === 0) {
+        // Even if no matches, update lastCheckedLt to avoid reprocessing
+        if (latestLt) {
+          await this.saveLastCheckedLt(latestLt);
+        }
         return; // No new matching transactions
       }
 
@@ -101,9 +110,69 @@ export class BlockchainWorker {
       for (const match of matches) {
         await this.processDepositMatch(match);
       }
+
+      // Update lastCheckedLt in database after processing all transactions
+      // This ensures we don't reprocess the same transactions on next run
+      if (latestLt) {
+        await this.saveLastCheckedLt(latestLt);
+        console.log(`💾 Updated lastCheckedLt to ${latestLt}`);
+      }
     } catch (error) {
       console.error('Error checking transactions:', error);
       // Don't throw - worker should continue running
+    }
+  }
+
+  /**
+   * Load lastCheckedLt from database
+   */
+  private async loadLastCheckedLt(): Promise<void> {
+    try {
+      const state = await prisma.workerState.findUnique({
+        where: { workerType: 'blockchain-worker' },
+      });
+      
+      if (state?.lastCheckedLt) {
+        console.log(`📊 Loaded lastCheckedLt from database: ${state.lastCheckedLt}`);
+      }
+    } catch (error) {
+      console.error('Error loading lastCheckedLt:', error);
+      // Continue without lastCheckedLt - will process all transactions on first run
+    }
+  }
+
+  /**
+   * Get lastCheckedLt from database
+   */
+  private async getLastCheckedLt(): Promise<string | null> {
+    try {
+      const state = await prisma.workerState.findUnique({
+        where: { workerType: 'blockchain-worker' },
+      });
+      return state?.lastCheckedLt || null;
+    } catch (error) {
+      console.error('Error getting lastCheckedLt:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Save lastCheckedLt to database (persistent storage)
+   */
+  private async saveLastCheckedLt(lt: string): Promise<void> {
+    try {
+      await prisma.workerState.upsert({
+        where: { workerType: 'blockchain-worker' },
+        update: { lastCheckedLt: lt },
+        create: {
+          id: 'blockchain-worker',
+          workerType: 'blockchain-worker',
+          lastCheckedLt: lt,
+        },
+      });
+    } catch (error) {
+      console.error('Error saving lastCheckedLt:', error);
+      // Don't throw - worker should continue even if save fails
     }
   }
 
@@ -132,15 +201,40 @@ export class BlockchainWorker {
         return;
       }
 
-      // Verify amount matches (convert nanotons to TON for comparison)
-      const receivedAmountTon = escrowService.nanotonsToTon(match.amount);
-      const expectedAmount = intent.stake;
-
-      if (!escrowService.validateDepositAmount(receivedAmountTon, expectedAmount)) {
+      // CRITICAL: Verify transaction destination is escrow address (double-check)
+      const escrowAddress = escrowService.getEscrowAddress();
+      const txDestination = tx.inMsg?.destination?.address || tx.account?.address;
+      if (!txDestination || txDestination !== escrowAddress) {
         console.warn(
-          `⚠️ Amount mismatch for intent ${match.intentId}: expected ${expectedAmount}, got ${receivedAmountTon}`
+          `⚠️ Transaction ${match.txHash} destination mismatch: expected ${escrowAddress}, got ${txDestination || 'unknown'}`
         );
         return;
+      }
+
+      // Convert nanotons to TON for comparison
+      const receivedAmountTon = escrowService.nanotonsToTon(match.amount);
+      
+      // CRITICAL: Verify amount >= entryFee (entryFee only, ignore gasReserve in check)
+      // Gas reserve may vary, but deposit must be at least entryFee
+      const entryFee = intent.stake; // entryFee without gasReserve
+      const TOLERANCE = 0.001; // Small rounding tolerance (0.001 TON)
+      
+      if (receivedAmountTon < entryFee - TOLERANCE) {
+        console.warn(
+          `⚠️ Amount too low for intent ${match.intentId}: received ${receivedAmountTon}, minimum entryFee ${entryFee}`
+        );
+        return;
+      }
+
+      // Additional check: amount should be close to expected (entryFee + gasReserve)
+      // But don't fail if it's higher - player may have sent more
+      const expectedWithGas = entryFee + parseFloat(process.env.TON_GAS_RESERVE || '0.05');
+      if (receivedAmountTon > expectedWithGas * 1.5) {
+        // Warn if amount is significantly higher (possible error)
+        console.warn(
+          `⚠️ Amount unusually high for intent ${match.intentId}: received ${receivedAmountTon}, expected ~${expectedWithGas}`
+        );
+        // Don't reject - player may have intentionally sent more
       }
 
       // Verify timestamp is reasonable

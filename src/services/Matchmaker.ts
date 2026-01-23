@@ -339,6 +339,78 @@ export class Matchmaker {
   }
 
   /**
+   * Restore match from database by matchId
+   * Used when match is not in memory (e.g., after server restart)
+   */
+  async restoreMatchById(matchId: string): Promise<Match | null> {
+    // Check if already in memory
+    const existingMatch = this.activeMatches.get(matchId);
+    if (existingMatch) {
+      return existingMatch.match;
+    }
+
+    try {
+      const dbMatch = await prisma.match.findUnique({
+        where: { id: matchId },
+        include: {
+          players: {
+            where: {
+              leftEarly: false,
+              leftAt: null,
+            },
+            orderBy: {
+              joinedAt: 'asc',
+            },
+          },
+        },
+      });
+
+      if (!dbMatch) {
+        return null;
+      }
+
+      // Restore match from database
+      const restoredMatch: Match = {
+        id: dbMatch.id,
+        roomType: dbMatch.roomType as RoomType,
+        status: dbMatch.status as 'waiting' | 'playing' | 'finished',
+        players: dbMatch.players.map(p => ({
+          id: p.playerId,
+          name: p.playerName,
+          score: p.score,
+        })),
+        allPlayers: dbMatch.players.map(p => ({
+          id: p.playerId,
+          name: p.playerName,
+          score: p.score,
+        })),
+        currentRound: dbMatch.currentRound,
+        roundResults: [],
+        createdAt: dbMatch.createdAt,
+        startedAt: dbMatch.startedAt || undefined,
+        finishedAt: dbMatch.finishedAt || undefined,
+      };
+
+      // Add to active matches
+      this.activeMatches.set(dbMatch.id, {
+        match: restoredMatch,
+        sockets: new Set(),
+      });
+
+      // Restore playerToMatch mapping
+      for (const player of restoredMatch.players) {
+        this.playerToMatch.set(player.id, dbMatch.id);
+      }
+
+      console.log(`♻️ Restored match ${dbMatch.id} from database (${restoredMatch.players.length} players)`);
+      return restoredMatch;
+    } catch (error) {
+      console.error(`Error restoring match ${matchId} from database:`, error);
+      return null;
+    }
+  }
+
+  /**
    * Generate unique match ID
    */
   private generateMatchId(): string {

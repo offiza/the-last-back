@@ -13,20 +13,22 @@ const router = Router();
 router.post('/rooms/:roomType/join-intent', async (req, res) => {
   try {
     const { roomType } = req.params;
-    const { initData, userId } = req.body;
+    const { initData, userId, userName } = req.body;
 
     if (roomType !== 'ton') {
       res.status(400).json({ error: 'Join intent is only available for TON rooms' });
       return;
     }
 
-    // Parse playerId from Telegram initData or use fallback
+    // Parse playerId and playerName from Telegram initData or use fallback
     let playerId: string | undefined;
+    let playerName: string = userName || 'Player';
 
     if (initData) {
       const telegramUser = parseTelegramUser(initData);
       if (telegramUser) {
         playerId = telegramUser.id.toString();
+        playerName = telegramUser.first_name || playerName;
       }
     }
 
@@ -40,7 +42,7 @@ router.post('/rooms/:roomType/join-intent', async (req, res) => {
       return;
     }
 
-    const { intent, paymentParams } = await joinIntentService.createJoinIntent(playerId, 'ton');
+    const { intent, paymentParams } = await joinIntentService.createJoinIntent(playerId, playerName, 'ton');
 
     res.json({
       intent: {

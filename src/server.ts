@@ -48,14 +48,14 @@ app.get('/health', (req, res) => {
 // WebSocket handlers
 setupSocketHandlers(io);
 
-// Start blockchain worker
-blockchainWorker.start(io);
-
 // Start server
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready`);
   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+  
+  // Start blockchain worker (async to load lastCheckedLt from DB)
+  await blockchainWorker.start(io);
 });
 
 // Graceful shutdown

@@ -4,6 +4,9 @@ import { prisma } from '../db/prisma.js';
 export interface TonTransaction {
   hash: string;
   lt: string;
+  account?: {
+    address?: string; // Account address (escrow for incoming transactions)
+  };
   from?: {
     address: string;
   };
@@ -11,8 +14,13 @@ export interface TonTransaction {
     destination?: {
       address: string;
     };
+    value?: string | number; // Amount in nanotons
   }>;
   inMsg?: {
+    value?: string | number; // Amount in nanotons (CRITICAL: use only this for deposits)
+    destination?: {
+      address: string; // Destination address (should be escrow address)
+    };
     message?: {
       msg_data?: {
         text?: string;
@@ -70,11 +78,12 @@ export class TonBlockchainService {
   /**
    * Check incoming transactions to escrow address
    * Returns transactions that match our join intents
+   * Also returns the latest LT processed for tracking
    */
   async checkIncomingTransactions(
     escrowAddress: string,
     sinceLt?: string
-  ): Promise<TransactionMatch[]> {
+  ): Promise<{ matches: TransactionMatch[]; latestLt: string | null }> {
     try {
       // TonAPI v2 endpoint for account transactions
       // GET /v2/accounts/{account_id}/transactions
@@ -104,7 +113,7 @@ export class TonBlockchainService {
         return [];
       }
 
-      // Extract nonces from all active CREATED intents
+      // Extract nonces and roomIds from all active CREATED intents
       const activeIntents = await prisma.joinIntent.findMany({
         where: {
           status: 'CREATED',
@@ -115,10 +124,17 @@ export class TonBlockchainService {
         select: {
           id: true,
           nonce: true,
+          onChainRoomId: true,
         },
       });
 
-      const nonceMap = new Map(activeIntents.map(intent => [intent.nonce, intent.id]));
+      // Create map: nonce -> { intentId, onChainRoomId }
+      const nonceMap = new Map(
+        activeIntents.map(intent => [
+          intent.nonce,
+          { intentId: intent.id, onChainRoomId: intent.onChainRoomId },
+        ])
+      );
 
       // Match transactions with intents
       const matches: TransactionMatch[] = [];
@@ -131,22 +147,48 @@ export class TonBlockchainService {
           continue;
         }
 
-        // Extract nonce from comment (format: "join:{nonce}")
-        const nonce = this.extractNonceFromComment(comment);
-        if (!nonce || !nonceMap.has(nonce)) {
+        // Extract roomId and nonce from comment (format: "join:{roomId}:{nonce}")
+        const parsed = this.extractRoomIdAndNonceFromComment(comment);
+        if (!parsed) {
           continue;
         }
 
-        const intentId = nonceMap.get(nonce)!;
-        const fromAddress = tx.inMsg?.source?.address || tx.from?.address || '';
-        const amount = this.extractAmount(tx);
+        const { roomId, nonce } = parsed;
 
-        if (!fromAddress || !amount) {
+        // Find intent by nonce
+        const intentData = nonceMap.get(nonce);
+        if (!intentData) {
+          continue;
+        }
+
+        // Verify roomId matches (security check)
+        if (!intentData.onChainRoomId || intentData.onChainRoomId !== roomId) {
+          console.error(`⚠️ RoomId mismatch for intent ${intentData.intentId}: expected ${intentData.onChainRoomId}, got ${roomId}`);
+          continue;
+        }
+
+        // CRITICAL: Verify transaction destination is escrow address
+        // Must check that deposit actually went to escrow, not somewhere else
+        if (!this.verifyEscrowDestination(tx, escrowAddress)) {
+          console.warn(`⚠️ Transaction ${tx.hash} destination is not escrow address ${escrowAddress}. Skipping.`);
+          continue;
+        }
+
+        // Extract amount from inMsg.value ONLY (CRITICAL: not from outMessages)
+        const amount = this.extractAmount(tx);
+        if (!amount) {
+          console.warn(`⚠️ Transaction ${tx.hash} has no inMsg.value. Skipping.`);
+          continue;
+        }
+
+        const fromAddress = tx.inMsg?.source?.address || tx.from?.address || '';
+        if (!fromAddress) {
+          console.warn(`⚠️ Transaction ${tx.hash} has no source address. Skipping.`);
           continue;
         }
 
         matches.push({
-          intentId,
+          intentId: intentData.intentId,
           nonce,
           txHash: tx.hash,
           fromAddress,
@@ -154,7 +196,18 @@ export class TonBlockchainService {
         });
       }
 
-      return matches;
+      // Find the latest LT from all processed transactions
+      let latestLt: string | null = null;
+      for (const tx of data.transactions) {
+        if (tx.lt && (!latestLt || tx.lt > latestLt)) {
+          latestLt = tx.lt;
+        }
+      }
+
+      return {
+        matches,
+        latestLt: latestLt || sinceLt || null, // Use latest LT or keep sinceLt
+      };
     } catch (error) {
       console.error('Error checking incoming transactions:', error);
       throw error;
@@ -177,60 +230,132 @@ export class TonBlockchainService {
   }
 
   /**
-   * Extract nonce from comment
-   * Format: "join:{nonce}" or just "{nonce}"
+   * Extract roomId and nonce from comment
+   * Format: "join:{roomId}:{nonce}"
+   * Example: "join:115885390262228992:9912312"
+   * 
+   * @returns { roomId: string, nonce: string } or null if format invalid
    */
-  private extractNonceFromComment(comment: string): string | null {
+  private extractRoomIdAndNonceFromComment(comment: string): { roomId: string; nonce: string } | null {
     // Remove any whitespace
     const trimmed = comment.trim();
 
-    // Try format "join:{nonce}"
+    // Try new format "join:{roomId}:{nonce}"
     if (trimmed.startsWith('join:')) {
-      return trimmed.substring(5);
+      const parts = trimmed.substring(5).split(':');
+      if (parts.length === 2) {
+        const [roomId, nonce] = parts;
+        // Validate nonce is 64 hex characters
+        if (/^[0-9a-fA-F]{64}$/.test(nonce)) {
+          return { roomId, nonce };
+        }
+      }
+      return null;
     }
 
-    // Try direct nonce (hex string, 64 characters)
+    // Fallback: try old format "join:{nonce}" for backward compatibility
+    if (trimmed.startsWith('join:')) {
+      const nonce = trimmed.substring(5);
+      if (/^[0-9a-fA-F]{64}$/.test(nonce)) {
+        // Return null for old format - we need roomId now
+        return null;
+      }
+    }
+
+    // Try direct nonce (hex string, 64 characters) - deprecated
     if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-      return trimmed;
+      return null; // Old format without roomId
     }
 
     return null;
+  }
+
+  /**
+   * Extract nonce from comment (backward compatibility)
+   * @deprecated Use extractRoomIdAndNonceFromComment instead
+   */
+  private extractNonceFromComment(comment: string): string | null {
+    const result = this.extractRoomIdAndNonceFromComment(comment);
+    return result?.nonce || null;
   }
 
   /**
    * Extract amount from transaction
    * Returns amount in nanotons as string
+   * 
+   * CRITICAL: Use ONLY inMsg.value for deposits to escrow address.
+   * Do NOT use outMessages - they can be internal transfers/notifications
+   * and don't represent the actual deposit amount from the player.
+   * 
+   * For deposits:
+   * - amount = inMsg.value (amount sent TO escrow address)
+   * - inMsg.destination must be escrow address (verified separately)
    */
   private extractAmount(tx: TonTransaction): string | null {
-    // Amount is typically in the inMsg or transaction value
-    // For now, we'll need to parse from transaction structure
-    // This might need adjustment based on actual TonAPI response format
-    
-    // TODO: Parse actual amount from transaction
-    // For now, return null - we'll need to check actual TonAPI response structure
+    // CRITICAL: Only use inMsg.value for deposits
+    // Do not use outMessages - they can be internal transfers
+    if (tx.inMsg?.value) {
+      const value = typeof tx.inMsg.value === 'string' 
+        ? tx.inMsg.value 
+        : tx.inMsg.value.toString();
+      return value;
+    }
+
+    // If no inMsg.value, this is not a valid deposit transaction
     return null;
   }
 
   /**
-   * Match transaction to intent by nonce
+   * Verify transaction destination is escrow address
+   * CRITICAL: Must check that deposit actually went to escrow, not somewhere else
+   */
+  private verifyEscrowDestination(tx: TonTransaction, escrowAddress: string): boolean {
+    // Check inMsg.destination (most reliable)
+    if (tx.inMsg?.destination?.address) {
+      return tx.inMsg.destination.address === escrowAddress;
+    }
+
+    // Fallback: check account.address (should be escrow for incoming transactions)
+    if (tx.account?.address) {
+      return tx.account.address === escrowAddress;
+    }
+
+    // If we can't verify destination, reject (safety first)
+    return false;
+  }
+
+  /**
+   * Match transaction to intent by nonce and roomId
+   * Format: join:{roomId}:{nonce}
+   * Validates that intent.onChainRoomId matches roomId from comment
    */
   async matchTransactionToIntent(
     txHash: string,
     comment: string
-  ): Promise<{ intentId: string; nonce: string } | null> {
-    const nonce = this.extractNonceFromComment(comment);
-    if (!nonce) {
+  ): Promise<{ intentId: string; nonce: string; roomId: string } | null> {
+    const parsed = this.extractRoomIdAndNonceFromComment(comment);
+    if (!parsed) {
       return null;
     }
 
+    const { roomId, nonce } = parsed;
+
+    // Find intent by nonce
     const intent = await joinIntentService.getIntentByNonce(nonce);
     if (!intent || intent.status !== 'CREATED') {
+      return null;
+    }
+
+    // Verify roomId matches (important security check)
+    if (!intent.onChainRoomId || intent.onChainRoomId !== roomId) {
+      console.error(`⚠️ RoomId mismatch for intent ${intent.id}: expected ${intent.onChainRoomId}, got ${roomId}`);
       return null;
     }
 
     return {
       intentId: intent.id,
       nonce,
+      roomId,
     };
   }
 

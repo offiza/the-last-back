@@ -1,11 +1,16 @@
 import { prisma } from '../db/prisma.js';
 import { walletService } from './WalletService.js';
+import { matchmaker } from './Matchmaker.js';
+import { matchService } from './MatchService.js';
+import { matchIdToRoomId, roomIdToString } from '../utils/roomId.js';
 import { ROOM_PRESETS } from '../constants/rooms.js';
+import { Player } from '../types/game.js';
 import crypto from 'crypto';
 
 export interface JoinIntent {
   id: string;
-  roomId: string | null;
+  roomId: string | null; // Match ID (string)
+  onChainRoomId: string | null; // On-chain room ID (uint64 as decimal string)
   playerId: string;
   walletId: string;
   roomType: 'ton';
@@ -31,10 +36,11 @@ const INTENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 export class JoinIntentService {
   /**
    * Create join intent for TON room entry
-   * Validates wallet connection and room availability
+   * Validates wallet connection, creates/finds match, and computes roomId
    */
   async createJoinIntent(
     playerId: string,
+    playerName: string = 'Player',
     roomType: 'ton'
   ): Promise<{ intent: JoinIntent; paymentParams: PaymentParams }> {
     // Verify player has connected wallet
@@ -67,12 +73,29 @@ export class JoinIntentService {
     if (existingIntent) {
       console.log(`⚠️ Player ${playerId} already has active intent ${existingIntent.id}`);
       // Return existing intent with payment params
-      const paymentParams = this.getPaymentParams(existingIntent);
+      const intent = this.dbIntentToIntent(existingIntent);
+      const paymentParams = this.getPaymentParams(intent);
       return {
-        intent: this.dbIntentToIntent(existingIntent),
+        intent,
         paymentParams,
       };
     }
+
+    // Create or find match through matchmaker
+    const player: Player = {
+      id: playerId,
+      name: playerName,
+      score: 0,
+    };
+
+    const match = await matchmaker.findOrCreateMatch(roomType, player);
+    
+    // Compute on-chain roomId from matchId
+    const onChainRoomId = matchIdToRoomId(match.id);
+    const onChainRoomIdStr = roomIdToString(onChainRoomId);
+    
+    // Save match to database (roomId will be computed and saved by matchService.saveMatch)
+    await matchService.saveMatch(match);
 
     // Calculate stake (entryFee in TON)
     const stake = preset.entryFee;
@@ -83,11 +106,13 @@ export class JoinIntentService {
     // Calculate expiration (5 minutes from now)
     const expiresAt = new Date(Date.now() + INTENT_TIMEOUT_MS);
 
-    // Create intent
+    // Create intent with matchId and onChainRoomId
     const dbIntent = await prisma.joinIntent.create({
       data: {
         playerId,
         walletId: wallet.id,
+        roomId: match.id, // Match ID (string)
+        onChainRoomId: onChainRoomIdStr, // On-chain room ID (uint64 as decimal string)
         roomType,
         stake,
         nonce,
@@ -96,7 +121,7 @@ export class JoinIntentService {
       },
     });
 
-    console.log(`✅ Created join intent ${dbIntent.id} for player ${playerId}, nonce: ${nonce}`);
+    console.log(`✅ Created join intent ${dbIntent.id} for player ${playerId}, matchId: ${match.id}, roomId: ${onChainRoomIdStr}, nonce: ${nonce}`);
 
     const intent = this.dbIntentToIntent(dbIntent);
     const paymentParams = this.getPaymentParams(intent);
@@ -106,6 +131,8 @@ export class JoinIntentService {
 
   /**
    * Get payment parameters for TON Connect sendTransaction
+   * Format: join:{roomId}:{nonce}
+   * Amount: entryFee + gasReserve (default 0.05 TON)
    */
   getPaymentParams(intent: JoinIntent): PaymentParams {
     // Get escrow address from environment variable
@@ -115,16 +142,26 @@ export class JoinIntentService {
       throw new Error('TON_ESCROW_ADDRESS not configured in environment');
     }
 
-    // Convert TON to nanotons (1 TON = 10^9 nanotons)
-    const nanotons = Math.floor(intent.stake * 1_000_000_000).toString();
+    if (!intent.onChainRoomId) {
+      throw new Error('Intent missing onChainRoomId. Cannot create payment params.');
+    }
 
-    // Comment contains nonce for transaction matching
-    // Format: "join:{nonce}" to make it identifiable
-    const comment = `join:${intent.nonce}`;
+    // Gas reserve for transaction (0.05 TON default)
+    const GAS_RESERVE_TON = parseFloat(process.env.TON_GAS_RESERVE || '0.05');
+    const totalAmount = intent.stake + GAS_RESERVE_TON;
+
+    // Convert TON to nanotons (1 TON = 10^9 nanotons)
+    const entryNano = Math.floor(intent.stake * 1_000_000_000);
+    const gasReserveNano = Math.floor(GAS_RESERVE_TON * 1_000_000_000);
+    const totalNano = (entryNano + gasReserveNano).toString();
+
+    // Comment format: join:{roomId}:{nonce}
+    // Example: join:115885390262228992:9912312
+    const comment = `join:${intent.onChainRoomId}:${intent.nonce}`;
 
     return {
       to: escrowAddress,
-      amount: nanotons,
+      amount: totalNano, // entryFee + gasReserve
       comment,
     };
   }
@@ -271,15 +308,15 @@ export class JoinIntentService {
 
   /**
    * Get paid intent for player that can be used to join a room
-   * Returns the most recent PAID intent that is not yet linked to a match
+   * Now intent is created with roomId immediately, so we find by matchId
    */
-  async getPaidIntentForJoin(playerId: string, roomType: 'ton'): Promise<JoinIntent | null> {
+  async getPaidIntentForJoin(playerId: string, matchId: string, roomType: 'ton'): Promise<JoinIntent | null> {
     const dbIntent = await prisma.joinIntent.findFirst({
       where: {
         playerId,
         roomType,
         status: 'PAID',
-        roomId: null, // Not yet linked to a match
+        roomId: matchId, // Intent is created with roomId (matchId) immediately
       },
       orderBy: {
         paidAt: 'desc',
@@ -397,6 +434,7 @@ export class JoinIntentService {
     return {
       id: dbIntent.id,
       roomId: dbIntent.roomId,
+      onChainRoomId: dbIntent.onChainRoomId,
       playerId: dbIntent.playerId,
       walletId: dbIntent.walletId,
       roomType: dbIntent.roomType as 'ton',

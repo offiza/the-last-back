@@ -106,12 +106,33 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
       }
 
       // For paid rooms, verify payment before joining
-      let paidIntent: any = null; // Store TON intent for later linking
+      let paidIntent: any = null; // Store TON intent for later
+      let matchIdFromIntent: string | null = null; // For TON rooms, matchId comes from intent
       
       if (roomType !== 'free') {
         if (roomType === 'ton') {
-          // For TON rooms, verify JoinIntent instead of payment
-          paidIntent = await joinIntentService.getPaidIntentForJoin(playerId, 'ton');
+          // For TON rooms, intent is created with roomId (matchId) immediately
+          // Find PAID intent to get matchId
+          const playerIntent = await prisma.joinIntent.findFirst({
+            where: {
+              playerId,
+              roomType: 'ton',
+              status: 'PAID',
+            },
+            orderBy: {
+              paidAt: 'desc',
+            },
+          });
+
+          if (!playerIntent || !playerIntent.roomId) {
+            socket.emit('error', { 
+              message: 'No paid deposit found. Please complete the deposit transaction first.' 
+            });
+            return;
+          }
+
+          matchIdFromIntent = playerIntent.roomId;
+          paidIntent = await joinIntentService.getPaidIntentForJoin(playerId, matchIdFromIntent, 'ton');
           
           if (!paidIntent) {
             socket.emit('error', { 
@@ -120,7 +141,7 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
             return;
           }
 
-          console.log(`✅ Verified paid JoinIntent ${paidIntent.id} for player ${playerId} joining TON room`);
+          console.log(`✅ Verified paid JoinIntent ${paidIntent.id} for player ${playerId}, matchId: ${matchIdFromIntent}`);
         } else if (roomType === 'stars') {
           // For Stars rooms, verify Telegram payment
           if (!paymentId || !paymentSignature) {
@@ -149,7 +170,47 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
         score: 0,
       };
 
-      const match = await matchmaker.findOrCreateMatch(roomType, player);
+      let match: any;
+      
+      if (roomType === 'ton' && matchIdFromIntent) {
+        // For TON rooms, use matchId from intent
+        // Try to get existing match from matchmaker
+        match = matchmaker.getMatch(matchIdFromIntent);
+        
+        if (!match) {
+          // Match might not be in memory, restore from DB
+          match = await matchmaker.restoreMatchById(matchIdFromIntent);
+          
+          if (!match) {
+            socket.emit('error', { 
+              message: 'Match not found. The match may have expired. Please create a new intent.' 
+            });
+            return;
+          }
+        }
+
+        // Add player to match if not already there
+        const playerExists = match.players.some((p: Player) => p.id === playerId);
+        if (!playerExists) {
+          match.players.push(player);
+          if (!match.allPlayers) {
+            match.allPlayers = [...match.players];
+          } else {
+            const existsInAll = match.allPlayers.some((p: Player) => p.id === playerId);
+            if (!existsInAll) {
+              match.allPlayers.push(player);
+            }
+          }
+        }
+        
+        // Ensure match is in matchmaker's activeMatches
+        // Use matchmaker's methods to register
+        matchmaker.addSocketToMatch(match.id, socket.id, playerId);
+      } else {
+        // For free/Stars rooms, create or find match normally
+        match = await matchmaker.findOrCreateMatch(roomType, player);
+        matchmaker.addSocketToMatch(match.id, socket.id, playerId);
+      }
       matchmaker.addSocketToMatch(match.id, socket.id, playerId);
 
       // Save match to database
@@ -160,19 +221,14 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
         // Continue anyway, match can work without DB
       }
 
-      // Link payment/intent to match if paid room
-      if (roomType !== 'free') {
+      // Link payment to match if Stars room
+      // For TON rooms, intent is already linked via roomId when created
+      if (roomType !== 'free' && roomType === 'stars' && paymentId) {
         try {
-          if (roomType === 'ton' && paidIntent) {
-            // Link JoinIntent to match for TON rooms
-            await joinIntentService.linkIntentToMatch(paidIntent.id, match.id);
-          } else if (roomType === 'stars' && paymentId) {
-            // Link Payment to match for Stars rooms
-            await paymentService.linkPaymentToMatch(paymentId, match.id);
-          }
+          await paymentService.linkPaymentToMatch(paymentId, match.id);
         } catch (error) {
-          console.error('Failed to link payment/intent to match:', error);
-          // Continue anyway, payment/intent is already verified
+          console.error('Failed to link payment to match:', error);
+          // Continue anyway, payment is already verified
         }
       }
 

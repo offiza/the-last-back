@@ -32,6 +32,7 @@ model PlayerStats {
 // Match records
 model Match {
   id          String   @id @default(cuid())
+  roomId      String?  // On-chain room ID (uint64 as decimal string, computed from matchId)
   roomType    String   // 'free' | 'stars' | 'ton'
   status      String   // 'waiting' | 'playing' | 'finished'
   currentRound Int     @default(0)
@@ -47,6 +48,7 @@ model Match {
 
   @@index([roomType, status])
   @@index([finishedAt])
+  @@index([roomId])
   @@map("matches")
 }
 
@@ -121,7 +123,8 @@ model Wallet {
 // Join Intent - намерение входа в комнату за TON
 model JoinIntent {
   id          String   @id @default(cuid())
-  roomId      String?  // Match ID (null если комната еще не создана)
+  roomId      String?  // Match ID (string matchId)
+  onChainRoomId String? // On-chain room ID (uint64 as decimal string, для escrow контракта)
   playerId    String   // Telegram user ID
   walletId    String   // Reference to Wallet
   roomType    String   // 'ton'
@@ -144,6 +147,7 @@ model JoinIntent {
   @@index([nonce])
   @@index([status, expiresAt]) // Для авто-отмены просроченных
   @@index([walletId])
+  @@index([onChainRoomId])
   @@map("join_intents")
 }
 
@@ -189,4 +193,15 @@ model Refund {
   @@index([txHash])
   @@index([status])
   @@map("refunds")
+}
+
+// Worker state for persisting lastCheckedLt
+model WorkerState {
+  id           String   @id @default("blockchain-worker")
+  workerType   String   @unique @default("blockchain-worker") // For future extensibility
+  lastCheckedLt String?  // Last processed transaction LT (logical time)
+  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now())
+
+  @@map("worker_states")
 }

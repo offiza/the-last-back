@@ -1,5 +1,6 @@
 import { Match, Player } from '../types/game';
 import { prisma } from '../db/prisma.js';
+import { matchIdToRoomId, roomIdToString } from '../utils/roomId.js';
 
 /**
  * Service for managing matches in the database
@@ -7,11 +8,17 @@ import { prisma } from '../db/prisma.js';
 export class MatchService {
   /**
    * Save or update a match in the database
+   * Computes and saves roomId (on-chain room ID) from matchId
    */
   async saveMatch(match: Match): Promise<void> {
     try {
+      // Compute on-chain roomId from matchId (always recompute for consistency)
+      const onChainRoomId = matchIdToRoomId(match.id);
+      const onChainRoomIdStr = roomIdToString(onChainRoomId);
+
       const matchData = {
         id: match.id,
+        roomId: onChainRoomIdStr, // On-chain room ID (uint64 as decimal string, always computed from matchId)
         roomType: match.roomType,
         status: match.status,
         currentRound: match.currentRound,
@@ -26,7 +33,7 @@ export class MatchService {
         create: matchData,
       });
       
-      console.log(`💾 Match ${match.id} saved to database: ${result.status} (${match.players.length} players)`);
+      console.log(`💾 Match ${match.id} saved to database: ${result.status}, roomId: ${onChainRoomIdStr} (${match.players.length} players)`);
 
       // Save/update players
       const playersToSave = match.allPlayers && match.allPlayers.length > 0 
