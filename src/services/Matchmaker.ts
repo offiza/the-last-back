@@ -1,6 +1,9 @@
 import { Match, Player, RoomType, RoomPreset } from '../types/game';
 import { ROOM_PRESETS } from '../constants/rooms.js';
 import { prisma } from '../db/prisma.js';
+import { escrowContractService } from './EscrowContractService.js';
+import { matchIdToRoomId } from '../utils/roomId.js';
+import { toNano } from '@ton/core';
 
 interface ActiveMatch {
   match: Match;
@@ -176,6 +179,33 @@ export class Matchmaker {
 
     this.playerToMatch.set(player.id, match.id);
 
+    // For TON rooms, create room in escrow contract (if not already exists)
+    if (roomType === 'ton' && escrowContractService.isAdminWalletReady()) {
+      try {
+        const roomId = matchIdToRoomId(match.id);
+        
+        // Check if room already exists in contract
+        const existingRoom = await escrowContractService.getRoom(roomId);
+        if (existingRoom) {
+          console.log(`ℹ️ Room ${roomId} already exists in escrow contract for match ${match.id}`);
+        } else {
+          const entryNano = toNano(preset.entryFee.toString());
+          
+          await escrowContractService.createRoom({
+            roomId,
+            entryNano,
+            minPlayers: 2, // Minimum 2 players to start
+            maxPlayers: preset.maxPlayers,
+          });
+          
+          console.log(`✅ Created room ${roomId} in escrow contract for match ${match.id}`);
+        }
+      } catch (error) {
+        console.error(`❌ Failed to create room in escrow contract for match ${match.id}:`, error);
+        // Don't throw - match can continue without contract room (for development/testing)
+      }
+    }
+
     return match;
   }
 
@@ -267,6 +297,18 @@ export class Matchmaker {
     console.log(`🚀 Starting match ${matchId} with ${match.players.length} players`);
     match.status = 'playing';
     match.startedAt = new Date();
+
+    // For TON rooms, lock room in escrow contract
+    if (match.roomType === 'ton' && escrowContractService.isAdminWalletReady()) {
+      try {
+        const roomId = matchIdToRoomId(match.id);
+        await escrowContractService.lockRoom(roomId);
+        console.log(`✅ Locked room ${roomId} in escrow contract for match ${matchId}`);
+      } catch (error) {
+        console.error(`❌ Failed to lock room in escrow contract for match ${matchId}:`, error);
+        // Don't throw - match can continue without contract lock (for development/testing)
+      }
+    }
 
     return match;
   }

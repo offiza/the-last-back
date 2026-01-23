@@ -3,6 +3,7 @@ import { matchmaker } from '../services/Matchmaker.js';
 import { paymentService } from '../services/PaymentService.js';
 import { matchService } from '../services/MatchService.js';
 import { joinIntentService } from '../services/JoinIntentService.js';
+import { prisma } from '../db/prisma.js';
 import { Player, RoomType } from '../types/game';
 import { parseTelegramUser, validateTelegramData } from '../utils/telegram.js';
 import { ROOM_PRESETS } from '../constants/rooms.js';
@@ -131,7 +132,7 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
             return;
           }
 
-          matchIdFromIntent = playerIntent.roomId;
+          matchIdFromIntent = playerIntent.roomId; // roomId is guaranteed to be non-null after check above
           paidIntent = await joinIntentService.getPaidIntentForJoin(playerId, matchIdFromIntent, 'ton');
           
           if (!paidIntent) {

@@ -5,6 +5,11 @@ import { playerStatsService } from '../services/PlayerStats.js';
 import { paymentService } from '../services/PaymentService.js';
 import { matchService } from '../services/MatchService.js';
 import { determineWinners } from '../utils/gameLogic.js';
+import { escrowContractService } from '../services/EscrowContractService.js';
+import { walletService } from '../services/WalletService.js';
+import { matchIdToRoomId } from '../utils/roomId.js';
+import { Address, toNano, fromNano } from '@ton/core';
+import { ROOM_PRESETS } from '../constants/rooms.js';
 
 /**
  * Start a round (called by server when match starts or after previous round)
@@ -102,6 +107,71 @@ export async function endRoundForMatch(io: Server, matchId: string) {
         try {
           const paymentData = await paymentService.processMatchCompletion(match);
           console.log(`💰 Payment data created for match ${matchId}:`, paymentData);
+
+          // For TON rooms, send payout to escrow contract
+          if (match.roomType === 'ton' && escrowContractService.isAdminWalletReady()) {
+            try {
+              // Get wallet addresses for winners
+              const winnerWallets = await Promise.all(
+                winners.map(async (winner) => {
+                  const wallet = await walletService.getWalletByPlayerId(winner.id);
+                  if (!wallet) {
+                    console.warn(`⚠️ No wallet found for winner ${winner.id} (${winner.name})`);
+                    return null;
+                  }
+                  return {
+                    playerId: winner.id,
+                    address: Address.parse(wallet.address),
+                    amount: paymentData.payout,
+                  };
+                })
+              );
+
+              // Filter out winners without wallets
+              const validWallets = winnerWallets.filter((w): w is NonNullable<typeof w> => w !== null);
+
+              if (validWallets.length === 0) {
+                console.warn(`⚠️ No valid wallets found for winners in match ${matchId}. Skipping contract payout.`);
+              } else {
+                // Get room state to calculate actual pot
+                const roomId = matchIdToRoomId(match.id);
+                const roomState = await escrowContractService.getRoom(roomId);
+
+                if (roomState) {
+                  // Calculate payout amounts
+                  // Contract takes 10% fee, so potAfterFee = potNano * 0.9
+                  const FEE_BPS = 1000n;
+                  const BPS_DENOM = 10000n;
+                  const feeNano = (roomState.potNano * FEE_BPS) / BPS_DENOM;
+                  const potAfterFee = roomState.potNano - feeNano;
+                  
+                  // Split equally among winners
+                  const payoutPerWinner = potAfterFee / BigInt(validWallets.length);
+                  
+                  // Create payout list
+                  const payouts = validWallets.map((w) => ({
+                    to: w.address,
+                    amountNano: payoutPerWinner,
+                  }));
+
+                  // Send payout to contract
+                  await escrowContractService.payout({
+                    roomId,
+                    payouts,
+                  });
+
+                  console.log(
+                    `✅ Sent payout to escrow contract for match ${matchId}: ${validWallets.length} winners, ${fromNano(payoutPerWinner)} TON each`
+                  );
+                } else {
+                  console.warn(`⚠️ Room ${roomId} not found in contract. Skipping payout.`);
+                }
+              }
+            } catch (error) {
+              console.error(`❌ Error sending payout to escrow contract for match ${matchId}:`, error);
+              // Don't throw - payment data is already created in DB
+            }
+          }
         } catch (error) {
           console.error(`❌ Error processing payments for match ${matchId}:`, error);
         }
