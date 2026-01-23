@@ -245,7 +245,7 @@ export function setupMatchmakingHandlers(io: Server, socket: Socket) {
       let matchJustStarted = false;
       
       if (matchmaker.isMatchReady(match.id)) {
-        const startedMatch = matchmaker.startMatch(match.id);
+        const startedMatch = await matchmaker.startMatch(match.id);
         if (startedMatch) {
           matchToNotify = startedMatch;
           matchJustStarted = true;

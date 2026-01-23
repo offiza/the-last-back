@@ -69,19 +69,29 @@ export class BlockchainWorker {
       const escrowAddress = escrowService.getEscrowAddress();
       
       // Get active CREATED intents to check
-      const activeIntents = await prisma.joinIntent.findMany({
-        where: {
-          status: 'CREATED',
-          expiresAt: {
-            gt: new Date(),
+      let activeIntents: any[] = [];
+      try {
+        activeIntents = await prisma.joinIntent.findMany({
+          where: {
+            status: 'CREATED',
+            expiresAt: {
+              gt: new Date(),
+            },
           },
-        },
-        select: {
-          id: true,
-          nonce: true,
-          stake: true,
-        },
-      });
+          select: {
+            id: true,
+            nonce: true,
+            stake: true,
+          },
+        });
+      } catch (error: any) {
+        // Check if it's a connection error
+        if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+          console.warn('⚠️ Database not available. Skipping transaction check.');
+          return;
+        }
+        throw error; // Re-throw other errors
+      }
 
       if (activeIntents.length === 0) {
         return; // No active intents to check
@@ -135,8 +145,13 @@ export class BlockchainWorker {
       if (state?.lastCheckedLt) {
         console.log(`📊 Loaded lastCheckedLt from database: ${state.lastCheckedLt}`);
       }
-    } catch (error) {
-      console.error('Error loading lastCheckedLt:', error);
+    } catch (error: any) {
+      // Check if it's a connection error
+      if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+        console.warn('⚠️ Database not available. Blockchain worker will continue without persistent state.');
+      } else {
+        console.error('Error loading lastCheckedLt:', error);
+      }
       // Continue without lastCheckedLt - will process all transactions on first run
     }
   }
@@ -150,7 +165,12 @@ export class BlockchainWorker {
         where: { workerType: 'blockchain-worker' },
       });
       return state?.lastCheckedLt || null;
-    } catch (error) {
+    } catch (error: any) {
+      // Check if it's a connection error
+      if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+        // Database not available, return null silently
+        return null;
+      }
       console.error('Error getting lastCheckedLt:', error);
       return null;
     }
@@ -170,7 +190,12 @@ export class BlockchainWorker {
           lastCheckedLt: lt,
         },
       });
-    } catch (error) {
+    } catch (error: any) {
+      // Check if it's a connection error
+      if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+        // Database not available, skip saving silently
+        return;
+      }
       console.error('Error saving lastCheckedLt:', error);
       // Don't throw - worker should continue even if save fails
     }
@@ -244,47 +269,79 @@ export class BlockchainWorker {
       }
 
       // Check if DepositTx already exists (idempotency)
-      const existingDeposit = await prisma.depositTx.findUnique({
-        where: { txHash: match.txHash },
-      });
+      let existingDeposit = null;
+      try {
+        existingDeposit = await prisma.depositTx.findUnique({
+          where: { txHash: match.txHash },
+        });
+      } catch (error: any) {
+        if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+          console.warn('⚠️ Database not available. Cannot check existing deposits.');
+          return;
+        }
+        throw error;
+      }
 
       if (existingDeposit) {
         console.log(`ℹ️ Deposit transaction ${match.txHash} already processed`);
         
         // If intent is still CREATED, mark as PAID
         if (intent.status === 'CREATED') {
-          await joinIntentService.markIntentPaid(match.intentId, match.txHash);
+          try {
+            await joinIntentService.markIntentPaid(match.intentId, match.txHash);
+          } catch (error: any) {
+            if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+              console.warn('⚠️ Database not available. Cannot update intent status.');
+            }
+          }
         }
         
         return;
       }
 
       // Create DepositTx record
-      const depositTx = await prisma.depositTx.create({
-        data: {
-          joinIntentId: match.intentId,
-          txHash: match.txHash,
-          fromAddress: match.fromAddress,
-          toAddress: escrowService.getEscrowAddress(),
-          amount: receivedAmountTon,
-          status: 'CONFIRMED',
-          confirmedAt: new Date(tx.blockTime * 1000), // Convert seconds to milliseconds
-          blockNumber: tx.blockNumber ? BigInt(tx.blockNumber) : null,
-        },
-      });
+      try {
+        const depositTx = await prisma.depositTx.create({
+          data: {
+            joinIntentId: match.intentId,
+            txHash: match.txHash,
+            fromAddress: match.fromAddress,
+            toAddress: escrowService.getEscrowAddress(),
+            amount: receivedAmountTon,
+            status: 'CONFIRMED',
+            confirmedAt: new Date(tx.blockTime * 1000), // Convert seconds to milliseconds
+            blockNumber: tx.blockNumber ? BigInt(tx.blockNumber) : null,
+          },
+        });
 
-      // Mark intent as PAID
-      await joinIntentService.markIntentPaid(match.intentId, match.txHash);
+        // Mark intent as PAID
+        await joinIntentService.markIntentPaid(match.intentId, match.txHash);
+      } catch (error: any) {
+        if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+          console.warn('⚠️ Database not available. Cannot save deposit transaction.');
+          return;
+        }
+        throw error;
+      }
 
       console.log(`✅ Processed deposit for intent ${match.intentId}, tx: ${match.txHash}`);
 
       // Notify via WebSocket if available
       if (this.io) {
         // Get playerId from intent to send notification
-        const intentWithPlayer = await prisma.joinIntent.findUnique({
-          where: { id: match.intentId },
-          select: { playerId: true },
-        });
+        let intentWithPlayer = null;
+        try {
+          intentWithPlayer = await prisma.joinIntent.findUnique({
+            where: { id: match.intentId },
+            select: { playerId: true },
+          });
+        } catch (error: any) {
+          if (error?.code === 'ECONNREFUSED' || error?.code === 'P1001') {
+            console.warn('⚠️ Database not available. Cannot get player ID for notification.');
+            return;
+          }
+          throw error;
+        }
 
         if (intentWithPlayer) {
           // Emit to player's socket room (player:playerId)

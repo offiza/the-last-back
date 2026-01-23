@@ -55,10 +55,17 @@ export class EscrowContractService {
     }
     this.escrowAddress = Address.parse(escrowAddr);
 
-    // Initialize admin wallet if mnemonic is provided
+    // Initialize admin wallet if mnemonic is provided (async initialization)
+    // Note: This is called in constructor, so we can't use await directly
+    // We'll initialize it asynchronously
     const adminMnemonic = process.env.TON_ADMIN_MNEMONIC;
-    if (adminMnemonic) {
-      this.initializeAdminWallet(adminMnemonic);
+    if (adminMnemonic && adminMnemonic.trim().length > 0) {
+      // Initialize asynchronously (fire and forget)
+      this.initializeAdminWallet(adminMnemonic).catch((error) => {
+        console.error('❌ Failed to initialize admin wallet. Contract write operations will not be available.');
+        console.error('Error details:', error);
+        // Don't throw - server can continue without admin wallet (read-only mode)
+      });
     } else {
       console.warn(
         '⚠️ TON_ADMIN_MNEMONIC not configured. Contract write operations will not be available.'
@@ -69,16 +76,67 @@ export class EscrowContractService {
   /**
    * Initialize admin wallet from mnemonic
    */
-  private initializeAdminWallet(mnemonic: string) {
+  private async initializeAdminWallet(mnemonic: string) {
     try {
-      const key = mnemonicToWalletKey(mnemonic.split(' '));
+      // Validate mnemonic format
+      if (!mnemonic || typeof mnemonic !== 'string') {
+        throw new Error('Mnemonic must be a non-empty string');
+      }
+
+      // Split mnemonic into words
+      const trimmed = mnemonic.trim();
+      const words = trimmed.split(/\s+/).filter(word => word.length > 0);
+      
+      // Validate mnemonic length (should be 12 or 24 words)
+      if (words.length !== 12 && words.length !== 24) {
+        throw new Error(`Invalid mnemonic length: expected 12 or 24 words, got ${words.length}`);
+      }
+
+      // Convert mnemonic to wallet key (async)
+      let key;
+      try {
+        key = await mnemonicToWalletKey(words);
+      } catch (mnemonicError: any) {
+        // Provide more specific error message
+        const errorMsg = mnemonicError?.message || 'Unknown error';
+        throw new Error(`Failed to convert mnemonic to wallet key: ${errorMsg}. Make sure the mnemonic is valid BIP39 phrase.`);
+      }
+      
+      // Validate key structure
+      if (!key) {
+        throw new Error('mnemonicToWalletKey returned null or undefined');
+      }
+      
+      if (!key.publicKey) {
+        throw new Error('Generated key missing publicKey');
+      }
+      
+      if (!key.secretKey) {
+        throw new Error('Generated key missing secretKey');
+      }
+
+      // Validate key types (should be Buffers)
+      if (!Buffer.isBuffer(key.publicKey)) {
+        throw new Error(`publicKey is not a Buffer, got ${typeof key.publicKey}`);
+      }
+      
+      if (!Buffer.isBuffer(key.secretKey)) {
+        throw new Error(`secretKey is not a Buffer, got ${typeof key.secretKey}`);
+      }
+
+      // Create wallet contract
       const wallet = WalletContractV4.create({ publicKey: key.publicKey, workchain: 0 });
+      
       this.adminWallet = wallet;
       this.adminAddress = wallet.address;
       this.adminSecretKey = key.secretKey;
+      
       console.log(`✅ Admin wallet initialized: ${this.adminAddress.toString()}`);
     } catch (error) {
       console.error('❌ Failed to initialize admin wallet:', error);
+      if (error instanceof Error) {
+        throw new Error(`Invalid admin mnemonic: ${error.message}`);
+      }
       throw new Error('Invalid admin mnemonic');
     }
   }
@@ -118,8 +176,10 @@ export class EscrowContractService {
         [{ type: 'int', value: roomId }]
       );
 
-      if (result.exitCode !== 0) {
-        console.error(`❌ Getter failed with exit code ${result.exitCode}`);
+      // In newer versions of @ton/ton, runMethod doesn't return exitCode
+      // We check if stack is available instead
+      if (!result.stack) {
+        console.error(`❌ Getter failed: no stack in result`);
         return null;
       }
 
@@ -192,11 +252,15 @@ export class EscrowContractService {
       });
 
       // Send transaction
-      if (!this.adminSecretKey) {
-        throw new Error('Admin secret key not available');
+      if (!this.adminSecretKey || !this.adminWallet) {
+        throw new Error('Admin wallet not initialized');
       }
-      const seqno = await this.adminWallet.getSeqno();
-      const transfer = this.adminWallet.createTransfer({
+      
+      // Open wallet with provider
+      const openedWallet = this.client.open(this.adminWallet);
+      const seqno = await openedWallet.getSeqno();
+      
+      const transfer = openedWallet.createTransfer({
         secretKey: this.adminSecretKey,
         seqno,
         messages: [
@@ -210,14 +274,14 @@ export class EscrowContractService {
         sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
       });
 
-      await this.client.sendExternalMessage(this.adminWallet, transfer);
+      await openedWallet.send(transfer);
 
       // Wait for transaction to be processed
-      let currentSeqno = await this.adminWallet.getSeqno();
+      let currentSeqno = await openedWallet.getSeqno();
       let attempts = 0;
       while (currentSeqno === seqno && attempts < 30) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        currentSeqno = await this.adminWallet.getSeqno();
+        currentSeqno = await openedWallet.getSeqno();
         attempts++;
       }
 
@@ -249,11 +313,14 @@ export class EscrowContractService {
     try {
       const body = bodyLock({ roomId });
 
-      const seqno = await this.adminWallet.getSeqno();
-      const transfer = this.adminWallet.createTransfer({
-        secretKey: (await mnemonicToWalletKey(
-          process.env.TON_ADMIN_MNEMONIC!.split(' ')
-        )).secretKey,
+      if (!this.adminSecretKey || !this.adminWallet) {
+        throw new Error('Admin wallet not initialized');
+      }
+      
+      const openedWallet = this.client.open(this.adminWallet);
+      const seqno = await openedWallet.getSeqno();
+      const transfer = openedWallet.createTransfer({
+        secretKey: this.adminSecretKey,
         seqno,
         messages: [
           internal({
@@ -266,14 +333,14 @@ export class EscrowContractService {
         sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
       });
 
-      await this.client.sendExternalMessage(this.adminWallet, transfer);
+      await openedWallet.send(transfer);
 
       // Wait for transaction
-      let currentSeqno = await this.adminWallet.getSeqno();
+      let currentSeqno = await openedWallet.getSeqno();
       let attempts = 0;
       while (currentSeqno === seqno && attempts < 30) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        currentSeqno = await this.adminWallet.getSeqno();
+        currentSeqno = await openedWallet.getSeqno();
         attempts++;
       }
 
@@ -315,11 +382,14 @@ export class EscrowContractService {
         payouts: params.payouts,
       });
 
-      const seqno = await this.adminWallet.getSeqno();
-      const transfer = this.adminWallet.createTransfer({
-        secretKey: (await mnemonicToWalletKey(
-          process.env.TON_ADMIN_MNEMONIC!.split(' ')
-        )).secretKey,
+      if (!this.adminSecretKey || !this.adminWallet) {
+        throw new Error('Admin wallet not initialized');
+      }
+      
+      const openedWallet = this.client.open(this.adminWallet);
+      const seqno = await openedWallet.getSeqno();
+      const transfer = openedWallet.createTransfer({
+        secretKey: this.adminSecretKey,
         seqno,
         messages: [
           internal({
@@ -332,14 +402,14 @@ export class EscrowContractService {
         sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
       });
 
-      await this.client.sendExternalMessage(this.adminWallet, transfer);
+      await openedWallet.send(transfer);
 
       // Wait for transaction
-      let currentSeqno = await this.adminWallet.getSeqno();
+      let currentSeqno = await openedWallet.getSeqno();
       let attempts = 0;
       while (currentSeqno === seqno && attempts < 30) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        currentSeqno = await this.adminWallet.getSeqno();
+        currentSeqno = await openedWallet.getSeqno();
         attempts++;
       }
 
@@ -379,11 +449,14 @@ export class EscrowContractService {
         player: params.player,
       });
 
-      const seqno = await this.adminWallet.getSeqno();
-      const transfer = this.adminWallet.createTransfer({
-        secretKey: (await mnemonicToWalletKey(
-          process.env.TON_ADMIN_MNEMONIC!.split(' ')
-        )).secretKey,
+      if (!this.adminSecretKey || !this.adminWallet) {
+        throw new Error('Admin wallet not initialized');
+      }
+      
+      const openedWallet = this.client.open(this.adminWallet);
+      const seqno = await openedWallet.getSeqno();
+      const transfer = openedWallet.createTransfer({
+        secretKey: this.adminSecretKey,
         seqno,
         messages: [
           internal({
@@ -396,14 +469,14 @@ export class EscrowContractService {
         sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
       });
 
-      await this.client.sendExternalMessage(this.adminWallet, transfer);
+      await openedWallet.send(transfer);
 
       // Wait for transaction
-      let currentSeqno = await this.adminWallet.getSeqno();
+      let currentSeqno = await openedWallet.getSeqno();
       let attempts = 0;
       while (currentSeqno === seqno && attempts < 30) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        currentSeqno = await this.adminWallet.getSeqno();
+        currentSeqno = await openedWallet.getSeqno();
         attempts++;
       }
 

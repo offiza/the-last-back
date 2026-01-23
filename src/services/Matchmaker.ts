@@ -265,7 +265,7 @@ export class Matchmaker {
   /**
    * Start match (when full)
    */
-  startMatch(matchId: string): Match | undefined {
+  async startMatch(matchId: string): Promise<Match | undefined> {
     const activeMatch = this.activeMatches.get(matchId);
     if (!activeMatch) {
       console.warn(`⚠️ Cannot start match ${matchId}: not found in active matches`);
