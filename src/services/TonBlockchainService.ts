@@ -110,7 +110,7 @@ export class TonBlockchainService {
       const data = await response.json() as { transactions?: TonTransaction[] };
 
       if (!data.transactions || data.transactions.length === 0) {
-        return [];
+        return { matches: [], latestLt: sinceLt || null };
       }
 
       // Extract nonces and roomIds from all active CREATED intents
@@ -377,7 +377,7 @@ export class TonBlockchainService {
         return false;
       }
 
-      const data = await response.json();
+      const data = await response.json() as { hash?: string };
       
       // Transaction exists and is confirmed
       return !!data.hash;

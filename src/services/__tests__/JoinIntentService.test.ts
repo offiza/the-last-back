@@ -43,7 +43,7 @@ describe('JoinIntentService', () => {
       vi.mocked(walletService.getWalletByPlayerId).mockResolvedValue(null);
 
       await expect(
-        joinIntentService.createJoinIntent('player123', 'ton')
+        joinIntentService.createJoinIntent('player123', 'Player', 'ton')
       ).rejects.toThrow('Wallet not connected');
     });
 
@@ -78,15 +78,14 @@ describe('JoinIntentService', () => {
 
       // Mock the create to return intent with the nonce that will be generated
       // We need to capture the actual nonce that will be generated
-      vi.mocked(prisma.joinIntent.create).mockImplementation(async (args: any) => {
-        // The actual service will generate a nonce, so we use it from the data
-        return {
-          ...mockIntent,
-          nonce: args.data.nonce, // Use the nonce from the service
-        } as any;
-      });
+      vi.mocked(prisma.joinIntent.create).mockResolvedValue({
+        ...mockIntent,
+        onChainRoomId: null,
+        cancelledAt: null,
+        refundedAt: null,
+      } as any);
 
-      const result = await joinIntentService.createJoinIntent('player123', 'ton');
+      const result = await joinIntentService.createJoinIntent('player123', 'Player', 'ton');
 
       expect(result.intent).toBeDefined();
       expect(result.paymentParams).toBeDefined();
@@ -123,7 +122,7 @@ describe('JoinIntentService', () => {
       vi.mocked(walletService.getWalletByPlayerId).mockResolvedValue(mockWallet);
       vi.mocked(prisma.joinIntent.findFirst).mockResolvedValue(existingIntent as any);
 
-      const result = await joinIntentService.createJoinIntent('player123', 'ton');
+      const result = await joinIntentService.createJoinIntent('player123', 'Player', 'ton');
 
       expect(result.intent.id).toBe('existing1');
       expect(prisma.joinIntent.create).not.toHaveBeenCalled();
@@ -134,7 +133,7 @@ describe('JoinIntentService', () => {
     it('should return null if no paid intent found', async () => {
       vi.mocked(prisma.joinIntent.findFirst).mockResolvedValue(null);
 
-      const result = await joinIntentService.getPaidIntentForJoin('player123', 'ton');
+      const result = await joinIntentService.getPaidIntentForJoin('player123', 'match1', 'ton');
 
       expect(result).toBeNull();
     });
@@ -156,7 +155,7 @@ describe('JoinIntentService', () => {
 
       vi.mocked(prisma.joinIntent.findFirst).mockResolvedValue(mockIntent as any);
 
-      const result = await joinIntentService.getPaidIntentForJoin('player123', 'ton');
+      const result = await joinIntentService.getPaidIntentForJoin('player123', 'match1', 'ton');
 
       expect(result).not.toBeNull();
       expect(result?.id).toBe('intent1');

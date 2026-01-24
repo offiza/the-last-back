@@ -1,5 +1,10 @@
 // Decimal type from Prisma (used for database operations)
 // For calculations, we convert to number
+// Decimal is available from Prisma client types
+type Decimal = {
+  toNumber(): number;
+  toString(): string;
+};
 
 /**
  * Service for working with TON Smart Contract Escrow
