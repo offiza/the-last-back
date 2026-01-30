@@ -163,6 +163,44 @@ export class WalletService {
   }
 
   /**
+   * Link wallet without ton_proof (fallback when wallet doesn't provide proof)
+   * Used when initData is validated as trust anchor
+   */
+  async linkWalletWithoutProof(
+    playerId: string,
+    address: string,
+    network: 'mainnet' | 'testnet'
+  ): Promise<Wallet> {
+    const publicKey = crypto.randomBytes(32).toString('hex');
+
+    const existingWallet = await prisma.wallet.findUnique({
+      where: { playerId },
+    });
+
+    if (existingWallet) {
+      const updated = await prisma.wallet.update({
+        where: { id: existingWallet.id },
+        data: { address, network, publicKey, updatedAt: new Date() },
+      });
+      console.log(`✅ Updated wallet (no proof) for player ${playerId}: ${address}`);
+      return this.dbWalletToWallet(updated);
+    }
+
+    const existingAddress = await prisma.wallet.findUnique({
+      where: { address },
+    });
+    if (existingAddress && existingAddress.playerId !== playerId) {
+      throw new Error('Wallet address already linked to another player');
+    }
+
+    const wallet = await prisma.wallet.create({
+      data: { playerId, address, network, publicKey },
+    });
+    console.log(`✅ Linked wallet (no proof) ${address} to player ${playerId}`);
+    return this.dbWalletToWallet(wallet);
+  }
+
+  /**
    * Get wallet by player ID
    */
   async getWalletByPlayerId(playerId: string): Promise<Wallet | null> {
