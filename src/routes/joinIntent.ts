@@ -7,16 +7,26 @@ const router = Router();
 /**
  * POST /api/rooms/:roomType/join-intent
  * Create join intent for TON room
- * Body: { initData?, userId? }
- * Response: { intent: { id, status, expiresAt, ... }, paymentParams: { to, amount, comment } }
+ * Body: { initData?, userId?, userName?, walletAddress, walletNetwork }
+ * Wallet from frontend (TON Connect) - no backend verification needed.
  */
 router.post('/rooms/:roomType/join-intent', async (req, res) => {
   try {
     const { roomType } = req.params;
-    const { initData, userId, userName } = req.body;
+    const { initData, userId, userName, walletAddress, walletNetwork } = req.body;
 
     if (roomType !== 'ton') {
       res.status(400).json({ error: 'Join intent is only available for TON rooms' });
+      return;
+    }
+
+    if (!walletAddress || !walletNetwork) {
+      res.status(400).json({ error: 'Wallet address and network required. Connect your TON wallet first.' });
+      return;
+    }
+
+    if (walletNetwork !== 'mainnet' && walletNetwork !== 'testnet') {
+      res.status(400).json({ error: 'Invalid wallet network' });
       return;
     }
 
@@ -32,7 +42,6 @@ router.post('/rooms/:roomType/join-intent', async (req, res) => {
       }
     }
 
-    // Fallback to userId for development
     if (!playerId && userId) {
       playerId = userId;
     }
@@ -42,7 +51,13 @@ router.post('/rooms/:roomType/join-intent', async (req, res) => {
       return;
     }
 
-    const { intent, paymentParams } = await joinIntentService.createJoinIntent(playerId, playerName, 'ton');
+    const { intent, paymentParams } = await joinIntentService.createJoinIntent(
+      playerId,
+      playerName,
+      'ton',
+      walletAddress,
+      walletNetwork
+    );
 
     res.json({
       intent: {

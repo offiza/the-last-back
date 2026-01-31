@@ -36,18 +36,17 @@ const INTENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 export class JoinIntentService {
   /**
    * Create join intent for TON room entry
-   * Validates wallet connection, creates/finds match, and computes roomId
+   * Wallet is from frontend (TON Connect) - no verification step needed
    */
   async createJoinIntent(
     playerId: string,
     playerName: string = 'Player',
-    roomType: 'ton'
+    roomType: 'ton',
+    walletAddress: string,
+    walletNetwork: 'mainnet' | 'testnet'
   ): Promise<{ intent: JoinIntent; paymentParams: PaymentParams }> {
-    // Verify player has connected wallet
-    const wallet = await walletService.getWalletByPlayerId(playerId);
-    if (!wallet) {
-      throw new Error('Wallet not connected. Please connect your TON wallet first');
-    }
+    // Link wallet from frontend (creates or updates)
+    const wallet = await walletService.linkWalletWithoutProof(playerId, walletAddress, walletNetwork);
 
     // Get room preset
     const preset = ROOM_PRESETS.find((p) => p.type === roomType);

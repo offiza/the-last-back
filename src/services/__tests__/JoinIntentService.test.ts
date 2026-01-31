@@ -29,7 +29,7 @@ vi.mock('../../db/prisma.js', () => ({
 
 vi.mock('../WalletService.js', () => ({
   walletService: {
-    getWalletByPlayerId: vi.fn(),
+    linkWalletWithoutProof: vi.fn(),
   },
 }));
 
@@ -39,12 +39,49 @@ describe('JoinIntentService', () => {
   });
 
   describe('createJoinIntent', () => {
-    it('should throw error if wallet not connected', async () => {
-      vi.mocked(walletService.getWalletByPlayerId).mockResolvedValue(null);
+    it('should create intent with wallet from frontend', async () => {
+      const mockWallet = {
+        id: 'wallet1',
+        playerId: 'player123',
+        address: '0:abc123',
+        network: 'mainnet' as const,
+        publicKey: 'pubkey',
+        connectedAt: new Date(),
+      };
+      vi.mocked(walletService.linkWalletWithoutProof).mockResolvedValue(mockWallet);
+      vi.mocked(prisma.joinIntent.findFirst).mockResolvedValue(null);
+      vi.mocked(prisma.joinIntent.create).mockResolvedValue({
+        id: 'intent1',
+        roomId: 'match1',
+        onChainRoomId: '123',
+        playerId: 'player123',
+        walletId: 'wallet1',
+        roomType: 'ton',
+        stake: 0.1,
+        nonce: 'a'.repeat(64),
+        status: 'CREATED',
+        expiresAt: new Date(),
+        createdAt: new Date(),
+        paidAt: null,
+        cancelledAt: null,
+        refundedAt: null,
+      } as any);
 
-      await expect(
-        joinIntentService.createJoinIntent('player123', 'Player', 'ton')
-      ).rejects.toThrow('Wallet not connected');
+      const result = await joinIntentService.createJoinIntent(
+        'player123',
+        'Player',
+        'ton',
+        '0:abc123',
+        'mainnet'
+      );
+
+      expect(walletService.linkWalletWithoutProof).toHaveBeenCalledWith(
+        'player123',
+        '0:abc123',
+        'mainnet'
+      );
+      expect(result.intent).toBeDefined();
+      expect(result.paymentParams).toBeDefined();
     });
 
     it('should create intent with correct nonce format', async () => {
@@ -57,7 +94,7 @@ describe('JoinIntentService', () => {
         connectedAt: new Date(),
       };
 
-      vi.mocked(walletService.getWalletByPlayerId).mockResolvedValue(mockWallet);
+      vi.mocked(walletService.linkWalletWithoutProof).mockResolvedValue(mockWallet);
       vi.mocked(prisma.joinIntent.findFirst).mockResolvedValue(null);
 
       // Generate a valid 64-character hex nonce for the mock
@@ -85,7 +122,13 @@ describe('JoinIntentService', () => {
         refundedAt: null,
       } as any);
 
-      const result = await joinIntentService.createJoinIntent('player123', 'Player', 'ton');
+      const result = await joinIntentService.createJoinIntent(
+        'player123',
+        'Player',
+        'ton',
+        '0:abc123',
+        'mainnet'
+      );
 
       expect(result.intent).toBeDefined();
       expect(result.paymentParams).toBeDefined();
@@ -119,10 +162,16 @@ describe('JoinIntentService', () => {
         paidAt: null,
       };
 
-      vi.mocked(walletService.getWalletByPlayerId).mockResolvedValue(mockWallet);
+      vi.mocked(walletService.linkWalletWithoutProof).mockResolvedValue(mockWallet);
       vi.mocked(prisma.joinIntent.findFirst).mockResolvedValue(existingIntent as any);
 
-      const result = await joinIntentService.createJoinIntent('player123', 'Player', 'ton');
+      const result = await joinIntentService.createJoinIntent(
+        'player123',
+        'Player',
+        'ton',
+        '0:abc123',
+        'mainnet'
+      );
 
       expect(result.intent.id).toBe('existing1');
       expect(prisma.joinIntent.create).not.toHaveBeenCalled();
