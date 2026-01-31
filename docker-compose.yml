@@ -37,6 +37,7 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       PAYMENT_SECRET_KEY: ${PAYMENT_SECRET_KEY:-}
       TON_ESCROW_ADDRESS: ${TON_ESCROW_ADDRESS:-}
+      TON_NETWORK: ${TON_NETWORK:-testnet}
     ports:
       - "4444:4444"
     depends_on:

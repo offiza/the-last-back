@@ -1,3 +1,4 @@
+import { Cell } from '@ton/core';
 import { joinIntentService } from './JoinIntentService.js';
 import { prisma } from '../db/prisma.js';
 
@@ -42,21 +43,37 @@ export interface TransactionMatch {
   amount: string; // in nanotons
 }
 
+/** TonCenter v2 transaction format */
+interface TonCenterTransaction {
+  transaction_id: { lt: string; hash: string };
+  in_msg?: {
+    source?: string;
+    destination?: string;
+    value?: string;
+    message?: string; // base64
+  };
+  utime?: number;
+}
+
 /**
- * Service for interacting with TON blockchain via TonAPI
- * Handles transaction monitoring and verification
+ * Service for interacting with TON blockchain
+ * Uses TonCenter API (free, stable). TonAPI optional via TON_API_URL.
  */
 export class TonBlockchainService {
   private tonApiUrl: string;
   private tonApiKey: string | null;
+  private tonCenterUrl: string;
 
   constructor() {
-    // TonAPI base URL
-    // Mainnet: https://tonapi.io
-    // Testnet: https://testnet.tonapi.io
-    this.tonApiUrl = process.env.TON_API_URL || 'https://tonapi.io';
-    
-    // TonAPI key (optional, but recommended for higher rate limits)
+    const network = process.env.TON_NETWORK || 'testnet';
+    // TonCenter: free, no key needed. Mainnet vs testnet.
+    this.tonCenterUrl =
+      network === 'mainnet'
+        ? process.env.TON_MAINNET_ENDPOINT || 'https://toncenter.com/api/v2'
+        : process.env.TON_TESTNET_ENDPOINT || 'https://testnet.toncenter.com/api/v2';
+
+    // TonAPI (optional, can return 404 without key or if API changed)
+    this.tonApiUrl = process.env.TON_API_URL || (network === 'mainnet' ? 'https://tonapi.io' : 'https://testnet.tonapi.io');
     this.tonApiKey = process.env.TON_API_KEY || null;
   }
 
@@ -67,12 +84,40 @@ export class TonBlockchainService {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
-
     if (this.tonApiKey) {
       headers['Authorization'] = `Bearer ${this.tonApiKey}`;
     }
-
     return headers;
+  }
+
+  /**
+   * Decode text comment from TON message body (op 0x00000000 + UTF-8)
+   * Handles both raw base64 and BOC-encoded cell
+   */
+  private decodeCommentFromBase64(base64: string): string | null {
+    try {
+      const buf = Buffer.from(base64, 'base64');
+      if (buf.length < 4) return null;
+
+      // Try BOC (Cell serialization)
+      try {
+        const cells = Cell.fromBoc(buf);
+        if (cells.length > 0) {
+          const slice = cells[0].beginParse();
+          if (slice.loadUint(32) === 0) {
+            return slice.loadStringTail().trim();
+          }
+        }
+      } catch {
+        // Not BOC, try raw
+      }
+
+      // Raw: op 4 bytes + UTF-8
+      if (buf.readUInt32BE(0) !== 0) return null;
+      return buf.slice(4).toString('utf-8').trim();
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -85,33 +130,52 @@ export class TonBlockchainService {
     sinceLt?: string
   ): Promise<{ matches: TransactionMatch[]; latestLt: string | null }> {
     try {
-      // TonAPI v2 endpoint for account transactions
-      // GET /v2/accounts/{account_id}/transactions
-      const url = `${this.tonApiUrl}/v2/accounts/${escrowAddress}/transactions`;
-      
+      // Use TonCenter API (free, stable). getTransactions?address=...
       const params = new URLSearchParams();
-      if (sinceLt) {
-        params.append('after_lt', sinceLt);
-      }
-      // Limit to last 100 transactions
+      params.append('address', escrowAddress);
       params.append('limit', '100');
+      // Note: TonCenter returns newest first. We filter by sinceLt in the loop.
 
-      const response = await fetch(`${url}?${params.toString()}`, {
+      const url = `${this.tonCenterUrl}/getTransactions?${params.toString()}`;
+      const response = await fetch(url, {
         method: 'GET',
-        headers: this.getHeaders(),
+        headers: { 'Content-Type': 'application/json' },
       });
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error(`TonAPI error: ${response.status} ${errorText}`);
+        console.error(`TonCenter error: ${response.status} ${errorText}`);
         throw new Error(`Failed to fetch transactions: ${response.status}`);
       }
 
-      const data = await response.json() as { transactions?: TonTransaction[] };
+      const data = (await response.json()) as {
+        ok?: boolean;
+        result?: TonCenterTransaction[];
+        description?: string;
+      };
 
-      if (!data.transactions || data.transactions.length === 0) {
+      if (!data.ok || !data.result || data.result.length === 0) {
         return { matches: [], latestLt: sinceLt || null };
       }
+
+      // Map TonCenter format to our TonTransaction format
+      const transactions: TonTransaction[] = data.result.map((tc) => {
+        const comment = tc.in_msg?.message ? this.decodeCommentFromBase64(tc.in_msg.message) : null;
+        return {
+          hash: tc.transaction_id?.hash || '',
+          lt: tc.transaction_id?.lt || '',
+          account: { address: escrowAddress },
+          inMsg: tc.in_msg
+            ? {
+                value: tc.in_msg.value,
+                destination: tc.in_msg.destination ? { address: tc.in_msg.destination } : undefined,
+                source: tc.in_msg.source ? { address: tc.in_msg.source } : undefined,
+                message: comment ? { msg_data: { text: comment } } : undefined,
+              }
+            : undefined,
+          blockTime: tc.utime || 0,
+        };
+      });
 
       // Extract nonces and roomIds from all active CREATED intents
       const activeIntents = await prisma.joinIntent.findMany({
@@ -139,7 +203,9 @@ export class TonBlockchainService {
       // Match transactions with intents
       const matches: TransactionMatch[] = [];
 
-      for (const tx of data.transactions) {
+      for (const tx of transactions) {
+        // Skip if we've already processed (when sinceLt is set)
+        if (sinceLt && tx.lt && BigInt(tx.lt) <= BigInt(sinceLt)) continue;
         // Check if transaction has a comment (in inMsg message data)
         const comment = this.extractComment(tx);
         
@@ -198,8 +264,8 @@ export class TonBlockchainService {
 
       // Find the latest LT from all processed transactions
       let latestLt: string | null = null;
-      for (const tx of data.transactions) {
-        if (tx.lt && (!latestLt || tx.lt > latestLt)) {
+      for (const tx of transactions) {
+        if (tx.lt && (!latestLt || BigInt(tx.lt) > BigInt(latestLt))) {
           latestLt = tx.lt;
         }
       }
