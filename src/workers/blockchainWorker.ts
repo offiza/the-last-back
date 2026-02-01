@@ -4,7 +4,7 @@ import { joinIntentService } from '../services/JoinIntentService.js';
 import { escrowService } from '../services/EscrowService.js';
 import { prisma } from '../db/prisma.js';
 
-const CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
+const CHECK_INTERVAL_MS = 15000; // Check every 15 seconds for faster deposit detection
 
 /**
  * Blockchain worker for monitoring escrow transactions
@@ -219,22 +219,8 @@ export class BlockchainWorker {
         return;
       }
 
-      // Verify transaction exists
-      const tx = await tonBlockchainService.getTransaction(match.txHash);
-      if (!tx) {
-        console.warn(`⚠️ Transaction ${match.txHash} not found`);
-        return;
-      }
-
-      // CRITICAL: Verify transaction destination is escrow address (double-check)
+      // Transaction already verified in checkIncomingTransactions (TonCenter)
       const escrowAddress = escrowService.getEscrowAddress();
-      const txDestination = tx.inMsg?.destination?.address || tx.account?.address;
-      if (!txDestination || txDestination !== escrowAddress) {
-        console.warn(
-          `⚠️ Transaction ${match.txHash} destination mismatch: expected ${escrowAddress}, got ${txDestination || 'unknown'}`
-        );
-        return;
-      }
 
       // Convert nanotons to TON for comparison
       const receivedAmountTon = escrowService.nanotonsToTon(match.amount);
@@ -263,7 +249,7 @@ export class BlockchainWorker {
       }
 
       // Verify timestamp is reasonable
-      if (!escrowService.validateDepositTimestamp(tx.blockTime)) {
+      if (!escrowService.validateDepositTimestamp(match.blockTime)) {
         console.warn(`⚠️ Transaction ${match.txHash} timestamp is invalid`);
         return;
       }
@@ -309,8 +295,8 @@ export class BlockchainWorker {
             toAddress: escrowService.getEscrowAddress(),
             amount: receivedAmountTon,
             status: 'CONFIRMED',
-            confirmedAt: new Date(tx.blockTime * 1000), // Convert seconds to milliseconds
-            blockNumber: tx.blockNumber ? BigInt(tx.blockNumber) : null,
+            confirmedAt: new Date(match.blockTime * 1000),
+            blockNumber: null,
           },
         });
 

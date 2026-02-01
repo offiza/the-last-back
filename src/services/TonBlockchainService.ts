@@ -41,6 +41,7 @@ export interface TransactionMatch {
   txHash: string;
   fromAddress: string;
   amount: string; // in nanotons
+  blockTime: number; // Unix timestamp (seconds)
 }
 
 /** TonCenter v2 transaction format */
@@ -259,6 +260,7 @@ export class TonBlockchainService {
           txHash: tx.hash,
           fromAddress,
           amount,
+          blockTime: tx.blockTime || 0,
         });
       }
 
