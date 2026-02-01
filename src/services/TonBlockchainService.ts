@@ -1,4 +1,4 @@
-import { Cell } from '@ton/core';
+import { Address, Cell } from '@ton/core';
 import { joinIntentService } from './JoinIntentService.js';
 import { prisma } from '../db/prisma.js';
 
@@ -44,14 +44,15 @@ export interface TransactionMatch {
   blockTime: number; // Unix timestamp (seconds)
 }
 
-/** TonCenter v2 transaction format */
+/** TonCenter v2 transaction format (ton-http-api) */
 interface TonCenterTransaction {
   transaction_id: { lt: string; hash: string };
   in_msg?: {
     source?: string;
     destination?: string;
     value?: string;
-    message?: string; // base64
+    message?: string; // base64 (legacy)
+    msg_data?: { body?: string; text?: string }; // common TonCenter format
   };
   utime?: number;
 }
@@ -159,9 +160,18 @@ export class TonBlockchainService {
         return { matches: [], latestLt: sinceLt || null };
       }
 
+      const txCount = data.result.length;
+
       // Map TonCenter format to our TonTransaction format
       const transactions: TonTransaction[] = data.result.map((tc) => {
-        const comment = tc.in_msg?.message ? this.decodeCommentFromBase64(tc.in_msg.message) : null;
+        let comment: string | null = null;
+        const msgData = tc.in_msg?.msg_data;
+        const rawMsg = tc.in_msg?.message ?? msgData?.body;
+        if (msgData?.text && typeof msgData.text === 'string') {
+          comment = msgData.text; // Already plain text
+        } else if (rawMsg && typeof rawMsg === 'string') {
+          comment = this.decodeCommentFromBase64(rawMsg); // base64 BOC or raw
+        }
         return {
           hash: tc.transaction_id?.hash || '',
           lt: tc.transaction_id?.lt || '',
@@ -200,6 +210,11 @@ export class TonBlockchainService {
           { intentId: intent.id, onChainRoomId: intent.onChainRoomId },
         ])
       );
+
+      if (activeIntents.length > 0 && process.env.DEBUG_TON_DEPOSITS === '1') {
+        const withComment = transactions.filter(t => this.extractComment(t));
+        console.log(`[TON] Escrow txs: ${txCount}, with comment: ${withComment.length}, active intents: ${activeIntents.length}`);
+      }
 
       // Match transactions with intents
       const matches: TransactionMatch[] = [];
@@ -375,20 +390,24 @@ export class TonBlockchainService {
 
   /**
    * Verify transaction destination is escrow address
-   * CRITICAL: Must check that deposit actually went to escrow, not somewhere else
+   * Normalizes addresses (base64 vs raw) before comparison
    */
   private verifyEscrowDestination(tx: TonTransaction, escrowAddress: string): boolean {
-    // Check inMsg.destination (most reliable)
+    const normalize = (addr: string) => {
+      try {
+        return Address.parse(addr).toString();
+      } catch {
+        return addr;
+      }
+    };
+    const escrowNorm = normalize(escrowAddress);
+
     if (tx.inMsg?.destination?.address) {
-      return tx.inMsg.destination.address === escrowAddress;
+      return normalize(tx.inMsg.destination.address) === escrowNorm;
     }
-
-    // Fallback: check account.address (should be escrow for incoming transactions)
     if (tx.account?.address) {
-      return tx.account.address === escrowAddress;
+      return normalize(tx.account.address) === escrowNorm;
     }
-
-    // If we can't verify destination, reject (safety first)
     return false;
   }
 

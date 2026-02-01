@@ -59,7 +59,7 @@ export class EscrowService {
    * Validate that deposit is within acceptable time window
    * (Not too old, not too far in future)
    */
-  validateDepositTimestamp(blockTime: number, maxAgeMinutes: number = 10): boolean {
+  validateDepositTimestamp(blockTime: number, maxAgeMinutes: number = 30): boolean {
     const now = Math.floor(Date.now() / 1000); // Current time in seconds
     const ageSeconds = now - blockTime;
 

@@ -35,12 +35,13 @@ export class EscrowContractService {
 
   constructor() {
     // Get network endpoint from environment
+    // TonClient uses JSON-RPC and requires /jsonRPC path (POST), not base /api/v2
     const network = process.env.TON_NETWORK || 'testnet';
     const endpoint =
       network === 'mainnet'
-        ? process.env.TON_MAINNET_ENDPOINT || 'https://toncenter.com/api/v2'
+        ? process.env.TON_MAINNET_ENDPOINT || 'https://toncenter.com/api/v2/jsonRPC'
         : process.env.TON_TESTNET_ENDPOINT ||
-          'https://testnet.toncenter.com/api/v2';
+          'https://testnet.toncenter.com/api/v2/jsonRPC';
 
     // Initialize TON client
     this.client = new TonClient({
